@@ -16,6 +16,9 @@ import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from api.session_persistence import (
+    SessionPersistenceHandle, SessionPersistenceRevoked, reopen_session_persistence,
+)
 from typing import Literal, cast, overload
 
 try:  # pragma: no cover - platform-specific imports.
@@ -427,6 +430,11 @@ def _index_entry_exists(session_id: str, in_memory_ids=None) -> bool:
     return p.exists()
 
 
+def _session_persistence_current(session):
+    handle = getattr(session, "_persistence_handle", None)
+    return not callable(handle) or handle().valid
+
+
 def _write_session_index(updates=None, *, session_dir: Path | None = None, session_index_file: Path | None = None):
     """Update the session index file.
 
@@ -477,7 +485,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 in_memory_entries = [
                     s.compact()
                     for s in SESSIONS.values()
-                    if s.session_id not in existing_ids
+                    if s.session_id not in existing_ids and _session_persistence_current(s)
                 ]
             entries.extend(in_memory_entries)
             entries.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
@@ -510,7 +518,8 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 raise ValueError("session index must be a list")
             with LOCK:
                 in_memory_ids = set(SESSIONS.keys())
-                updated_map = {s.session_id: s.compact() for s in updates}
+                updated_map = {s.session_id: s.compact() for s in updates
+                               if _session_persistence_current(s)}
 
             existing = [
                 e for e in existing
@@ -1668,6 +1677,18 @@ class Session:
             if _parsed_visible_count is not None and _parsed_visible_count >= 0
             else None
         )
+        self._persistence_handles = {}
+        if is_safe_session_id(self.session_id):
+            self._persistence_handle()
+
+    def _persistence_handle(self):
+        # Keep handles for identities visited during compression/snapshot saves.
+        # Revisiting an old id never borrows a newly imported lifetime.
+        key = (str(Path(SESSION_DIR).resolve()), self.session_id)
+        handles = self._persistence_handles
+        if key not in handles:
+            handles[key] = SessionPersistenceHandle(self.session_id, SESSION_DIR)
+        return handles[key]
 
     @property
     def path(self):
@@ -1697,6 +1718,11 @@ class Session:
             raise ValueError(
                 f"Refusing to save session {self.session_id!r}: messages must be a list, "
                 f"got {type(self.messages).__name__}."
+            )
+        persistence = self._persistence_handle()
+        if not persistence.valid:
+            raise SessionPersistenceRevoked(
+                f"Session {self.session_id!r} persistence authority was revoked"
             )
         if touch_updated_at:
             self.updated_at = time.time()
@@ -1791,177 +1817,162 @@ class Session:
                  and not k.startswith('_')}
         payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
 
-        # ── #1558 backup safeguard ──────────────────────────────────────
-        # Before overwriting the session file, copy the previous version to
-        # ``<sid>.json.bak`` IFF the previous file has more messages than the
-        # incoming payload. The asymmetric guard means:
-        #   * Normal grow-the-conversation saves never produce a backup
-        #     (incoming messages >= existing) — keeps disk overhead near zero.
-        #   * Any save that would shrink the messages array (the failure mode
-        #     of #1558, plus anything similar in the future) leaves a recoverable
-        #     snapshot of the pre-shrink state on disk.
-        # The recovery path is api/session_recovery.py — at server startup and
-        # via /api/session/recover, sessions whose JSON has fewer messages than
-        # their .bak get restored automatically.
-        try:
-            if self.path.exists():
-                # The on-disk count, without reading the body.
-                #
-                # The decision below is a function of ONE integer -- how many
-                # messages the file on disk holds -- and save() already writes
-                # that integer into the metadata prefix, before `messages`, as
-                # `message_count` (see METADATA_FIELDS above; load_metadata_only
-                # and the sidebar freshness check read it the same way). So read
-                # THAT through a bounded 64 KiB prefix instead of the whole file.
-                # Measured before this: a 203,439,398-byte sidecar cost 20,377 ms
-                # (17,453 in read_text, 2,924 in json.loads) to yield one integer,
-                # on EVERY save -- including the grow-saves that never back
-                # anything up. The prefix read is O(64 KiB), and because the count
-                # is part of the bytes on disk it travels with any rewrite of them.
-                #
-                # An in-memory "I wrote this, stat says nothing changed" cache is
-                # NOT sufficient here, and was removed after review: (inode, size,
-                # mtime_ns) is not a content identity. A same-length in-place
-                # rewrite inside one mtime tick keeps all three fields -- ext4
-                # stamps mtime from a coarse clock, so two writes in the same tick
-                # share one mtime_ns -- and a stale cached count then reads a real
-                # shrink as a growth and skips the #1558 backup. The prefix count
-                # cannot be fooled that way.
-                #
-                # Every unknown falls through to the full read + parse below: a
-                # legacy (pre-#5854) sidecar whose count is not in the prefix, a
-                # count written without the current writer's _mc_v marker (an
-                # older writer's count can be stale relative to the messages
-                # array next to it), a corrupt or truncated prefix, a file with
-                # no top-level `messages` key at all, or metadata alone that
-                # overflows the budget.
-                # Fail-open is the contract -- never "assume no shrink".
-                existing_text = None
-                existing = None
-                existing_guarded_messages = None
-                existing_exact_replay_rows_removed = 0
-                existing_msg_count = _prefix_message_count(self.path)
-                if existing_msg_count is None:
-                    existing_text = self.path.read_text(encoding='utf-8')
-                    try:
-                        existing = json.loads(existing_text)
-                        existing_messages = existing.get('messages') or []
-                        existing_msg_count = len(existing_messages)
-                        if isinstance(existing_messages, list):
-                            (
-                                existing_guarded_messages,
-                                existing_exact_replay_rows_removed,
-                            ) = _deduplicate_exact_stable_messages(existing_messages)
-                    except (json.JSONDecodeError, ValueError, AttributeError):
-                        existing_msg_count = -1  # corrupt → always back up
-                incoming_msg_count = len(guarded_messages or [])
-                if (
-                    existing_msg_count > 0
-                    and incoming_msg_count == 0
-                    and (self.active_stream_id or self.pending_user_message)
-                ):
-                    logger.warning(
-                        "refusing to overwrite session %s messages with empty active/pending snapshot "
-                        "(existing=%s, incoming=%s, stream=%s)",
-                        self.session_id,
-                        existing_msg_count,
-                        incoming_msg_count,
-                        self.active_stream_id,
-                    )
-                    return
-                if existing_msg_count > incoming_msg_count:
-                    bak_path = self.path.with_suffix('.json.bak')
-                    if existing_text is None:
-                        # The .bak body is the one thing that needs the full text,
-                        # and a shrink is the one time it is needed.
+        with persistence.writing():
+            # ── #1558 backup safeguard ──────────────────────────────────────
+            # Before overwriting the session file, copy the previous version to
+            # ``<sid>.json.bak`` IFF the previous file has more messages than the
+            # incoming payload. The asymmetric guard means:
+            #   * Normal grow-the-conversation saves never produce a backup
+            #     (incoming messages >= existing) — keeps disk overhead near zero.
+            #   * Any save that would shrink the messages array (the failure mode
+            #     of #1558, plus anything similar in the future) leaves a recoverable
+            #     snapshot of the pre-shrink state on disk.
+            # The recovery path is api/session_recovery.py — at server startup and
+            # via /api/session/recover, sessions whose JSON has fewer messages than
+            # their .bak get restored automatically.
+            try:
+                if self.path.exists():
+                    # The on-disk count, without reading the body.
+                    #
+                    # The decision below is a function of ONE integer -- how many
+                    # messages the file on disk holds -- and save() already writes
+                    # that integer into the metadata prefix, before `messages`, as
+                    # `message_count` (see METADATA_FIELDS above; load_metadata_only
+                    # and the sidebar freshness check read it the same way). So read
+                    # THAT through a bounded 64 KiB prefix instead of the whole file.
+                    # Measured before this: a 203,439,398-byte sidecar cost 20,377 ms
+                    # (17,453 in read_text, 2,924 in json.loads) to yield one integer,
+                    # on EVERY save -- including the grow-saves that never back
+                    # anything up. The prefix read is O(64 KiB), and because the count
+                    # is part of the bytes on disk it travels with any rewrite of them.
+                    #
+                    # An in-memory "I wrote this, stat says nothing changed" cache is
+                    # NOT sufficient here, and was removed after review: (inode, size,
+                    # mtime_ns) is not a content identity. A same-length in-place
+                    # rewrite inside one mtime tick keeps all three fields -- ext4
+                    # stamps mtime from a coarse clock, so two writes in the same tick
+                    # share one mtime_ns -- and a stale cached count then reads a real
+                    # shrink as a growth and skips the #1558 backup. The prefix count
+                    # cannot be fooled that way.
+                    #
+                    # Every unknown falls through to the full read + parse below: a
+                    # legacy (pre-#5854) sidecar whose count is not in the prefix, a
+                    # count written without the current writer's _mc_v marker (an
+                    # older writer's count can be stale relative to the messages
+                    # array next to it), a corrupt or truncated prefix, a file with
+                    # no top-level `messages` key at all, or metadata alone that
+                    # overflows the budget.
+                    # Fail-open is the contract -- never "assume no shrink".
+                    existing_text = None
+                    existing = None
+                    existing_guarded_messages = None
+                    existing_exact_replay_rows_removed = 0
+                    existing_msg_count = _prefix_message_count(self.path)
+                    if existing_msg_count is None:
                         existing_text = self.path.read_text(encoding='utf-8')
-                    if existing is None:
                         try:
                             existing = json.loads(existing_text)
                             existing_messages = existing.get('messages') or []
+                            existing_msg_count = len(existing_messages)
                             if isinstance(existing_messages, list):
                                 (
                                     existing_guarded_messages,
                                     existing_exact_replay_rows_removed,
                                 ) = _deduplicate_exact_stable_messages(existing_messages)
                         except (json.JSONDecodeError, ValueError, AttributeError):
-                            existing = None
-                    # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
-                    # mirroring the main save() pattern below. Prevents a
-                    # torn .bak from a crash mid-write or a concurrent
-                    # backup-producing save. Recovery defends against a
-                    # torn .bak (JSONDecodeError → no_action), so the
-                    # failure mode pre-fix was "backup is lost"; with
-                    # this fix the backup either lands cleanly or doesn't
-                    # land at all.
-                    try:
-                        backup_text = existing_text
-                        if (
-                            existing_exact_replay_rows_removed
-                            and isinstance(existing, dict)
-                            and isinstance(existing_guarded_messages, list)
-                        ):
-                            cleaned_existing = dict(existing)
-                            cleaned_existing['messages'] = existing_guarded_messages
-                            cleaned_existing['message_count'] = len(existing_guarded_messages)
-                            backup_text = json.dumps(cleaned_existing, ensure_ascii=False, indent=2)
-                            logger.warning(
-                                "Removed %d exact stable replay messages from backup for session %s",
-                                existing_exact_replay_rows_removed,
-                                self.session_id,
-                            )
-                        bak_tmp = bak_path.with_suffix(
-                            f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
+                            existing_msg_count = -1  # corrupt → always back up
+                    incoming_msg_count = len(guarded_messages or [])
+                    if (
+                        existing_msg_count > 0
+                        and incoming_msg_count == 0
+                        and (self.active_stream_id or self.pending_user_message)
+                    ):
+                        logger.warning(
+                            "refusing to overwrite session %s messages with empty active/pending snapshot "
+                            "(existing=%s, incoming=%s, stream=%s)",
+                            self.session_id,
+                            existing_msg_count,
+                            incoming_msg_count,
+                            self.active_stream_id,
                         )
-                        with open(bak_tmp, 'w', encoding='utf-8') as bf:
-                            bf.write(backup_text)
-                            bf.flush()
-                            os.fsync(bf.fileno())
-                        _safe_replace(bak_tmp, bak_path)
-                    except OSError:
-                        # Backup is best-effort; main save proceeds regardless.
+                        return
+                    if existing_msg_count > incoming_msg_count:
+                        bak_path = self.path.with_suffix('.json.bak')
+                        if existing_text is None:
+                            # The .bak body is the one thing that needs the full text,
+                            # and a shrink is the one time it is needed.
+                            existing_text = self.path.read_text(encoding='utf-8')
+                        if existing is None:
+                            try:
+                                existing = json.loads(existing_text)
+                                existing_messages = existing.get('messages') or []
+                                if isinstance(existing_messages, list):
+                                    (
+                                        existing_guarded_messages,
+                                        existing_exact_replay_rows_removed,
+                                    ) = _deduplicate_exact_stable_messages(existing_messages)
+                            except (json.JSONDecodeError, ValueError, AttributeError):
+                                existing = None
+                        # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
+                        # mirroring the main save() pattern below. Prevents a
+                        # torn .bak from a crash mid-write or a concurrent
+                        # backup-producing save. Recovery defends against a
+                        # torn .bak (JSONDecodeError → no_action), so the
+                        # failure mode pre-fix was "backup is lost"; with
+                        # this fix the backup either lands cleanly or doesn't
+                        # land at all.
                         try:
-                            bak_tmp.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-        except OSError:
-            pass
-
-        tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
-        try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            if skip_index:
-                # Callers that explicitly skip the sidebar projection retain
-                # the existing same-session concurrency contract: their unique
-                # temp files may replace the sidecar independently.
-                _safe_replace(tmp, self.path)
-            else:
-                # Publish the sidecar and its sidebar projection as one ordered
-                # operation. _write_session_index() uses this same RLock, so the
-                # nested acquisition is safe. Without the outer ownership, an
-                # older save can pause after replacing the sidecar, a newer save
-                # can publish both files, and then the older save can regress
-                # only the index with its frozen projection.
-                with _INDEX_WRITE_LOCK:
-                    _safe_replace(tmp, self.path)
-                    # Build the sidebar entry from the same guarded transcript
-                    # snapshot as the JSON payload. A shallow copy avoids
-                    # rebinding/mutating the live Session while keeping message
-                    # count, user count, and last-message time aligned with
-                    # what this save actually persisted.
-                    persisted_index_session = copy.copy(self)
-                    persisted_index_session.messages = guarded_messages
-                    persisted_index_session._metadata_message_count = len(guarded_messages)
-                    _write_session_index(updates=[persisted_index_session])
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
+                            backup_text = existing_text
+                            if (
+                                existing_exact_replay_rows_removed
+                                and isinstance(existing, dict)
+                                and isinstance(existing_guarded_messages, list)
+                            ):
+                                cleaned_existing = dict(existing)
+                                cleaned_existing['messages'] = existing_guarded_messages
+                                cleaned_existing['message_count'] = len(existing_guarded_messages)
+                                backup_text = json.dumps(cleaned_existing, ensure_ascii=False, indent=2)
+                                logger.warning(
+                                    "Removed %d exact stable replay messages from backup for session %s",
+                                    existing_exact_replay_rows_removed,
+                                    self.session_id,
+                                )
+                            bak_tmp = bak_path.with_suffix(
+                                f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
+                            )
+                            with open(bak_tmp, 'w', encoding='utf-8') as bf:
+                                bf.write(backup_text)
+                                bf.flush()
+                                os.fsync(bf.fileno())
+                            _safe_replace(bak_tmp, bak_path)
+                        except OSError:
+                            # Backup is best-effort; main save proceeds regardless.
+                            try:
+                                bak_tmp.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+            except OSError:
                 pass
-            raise
+
+            tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(tmp, self.path)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        if not skip_index:
+            with _INDEX_WRITE_LOCK:
+                persisted_index_session = copy.copy(self)
+                persisted_index_session.messages = guarded_messages
+                persisted_index_session._metadata_message_count = len(guarded_messages)
+                _write_session_index(updates=[persisted_index_session])
 
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
@@ -1979,7 +1990,6 @@ class Session:
         if self.messages:
             try:
                 _clear_webui_zero_message_orphan_tombstone(self.session_id)
-                _clear_webui_deleted_session_tombstone(self.session_id)
             except Exception:
                 logger.debug(
                     "Failed to clear webui tombstone for %s",
@@ -6496,7 +6506,13 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
 
 def get_session(sid, metadata_only=False):
     """Load a session, optionally with metadata only (skipping messages)."""
-    return _resolve_session(sid, metadata_only=metadata_only)
+    session = _resolve_session(sid, metadata_only=metadata_only)
+    if not _session_persistence_current(session):
+        with LOCK:
+            if SESSIONS.get(sid) is session:
+                SESSIONS.pop(sid, None)
+        raise KeyError(sid)
+    return session
 
 
 _COMPRESSION_RECOVERY_PROFILE_UNSET = object()
@@ -8431,6 +8447,14 @@ def import_cli_session(
         updated_at=updated_at,
         parent_session_id=parent_session_id,
     )
+    persistence = s._persistence_handle()
+    with persistence.gate.lock:
+        _clear_webui_deleted_session_tombstone(s.session_id)
+        if s.session_id in _load_webui_deleted_session_tombstone():
+            raise RuntimeError("Could not clear deletion record for explicit import")
+        reopen_session_persistence(persistence.gate)
+        s._persistence_handles.clear()
+        s._persistence_handle()
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
     # If that sid was previously tombstoned as a webui zero-message orphan,
     # clear the tombstone entry so the freshly-imported session is visible
@@ -8438,7 +8462,6 @@ def import_cli_session(
     # an import.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
-        _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
             "Failed to clear webui tombstone for %s",
