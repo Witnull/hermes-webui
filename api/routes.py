@@ -6704,21 +6704,24 @@ def _ip_is_loopback_or_private(raw: str):
     return (True, bool(addr.is_loopback or addr.is_private))
 
 
-def _trusted_proxy_networks():
+def _trusted_proxy_networks(include_loopback: bool = True):
     """Networks whose socket peer is allowed to assert a forwarded client IP.
 
-    Loopback is ALWAYS trusted implicitly (the common same-host reverse-proxy
-    deployment). Operators fronting the WebUI with a LAN/remote proxy add its
-    address(es) via HERMES_WEBUI_TRUSTED_PROXY_CIDRS (comma-separated CIDRs or
-    bare IPs). Malformed entries are skipped, never widening trust.
+    Loopback is trusted implicitly (the common same-host reverse-proxy
+    deployment) unless ``include_loopback`` is False. Operators fronting the
+    WebUI with a LAN/remote proxy add its address(es) via
+    HERMES_WEBUI_TRUSTED_PROXY_CIDRS (comma-separated CIDRs or bare IPs).
+    Malformed entries are skipped, never widening trust.
     """
     import ipaddress
 
-    nets = [
-        ipaddress.ip_network("127.0.0.0/8"),
-        ipaddress.ip_network("::1/128"),
-        ipaddress.ip_network("::ffff:127.0.0.0/104"),
-    ]
+    nets = []
+    if include_loopback:
+        nets = [
+            ipaddress.ip_network("127.0.0.0/8"),
+            ipaddress.ip_network("::1/128"),
+            ipaddress.ip_network("::ffff:127.0.0.0/104"),
+        ]
     raw = os.getenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "") or ""
     for token in raw.replace(";", ",").split(","):
         token = token.strip()
@@ -7028,15 +7031,20 @@ def _login_client_ip(handler) -> str:
     """Client IP that the login rate limiter keys on.
 
     Behind a reverse proxy the raw socket peer is the proxy, so every user
-    would share one bucket. Consult the forwarded chain under the same opt-in
-    trusted-proxy gate as ``_onboarding_request_is_local``, and fall back to
-    the raw peer whenever the result is not an IP address.
+    would share one bucket. Consult the forwarded chain only when
+    HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and the raw peer is listed in
+    HERMES_WEBUI_TRUSTED_PROXY_CIDRS. Implicit loopback trust is not enough:
+    a direct loopback or SSH-tunnel client could otherwise send a new
+    X-Forwarded-For on every attempt. Fall back to the raw peer whenever the
+    result is not an IP address.
     """
     import ipaddress
 
-    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR") and _raw_peer_is_trusted_proxy(handler):
+    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR"):
         try:
-            return str(ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler)))
+            peer = ipaddress.ip_address(_request_client_ip(handler))
+            if _ip_in_networks(peer, _trusted_proxy_networks(include_loopback=False)):
+                return str(ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler)))
         except ValueError:
             pass
     return _client_ip_for_rate_limit(handler)
