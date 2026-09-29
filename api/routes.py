@@ -18648,6 +18648,11 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, {"output": run_refine_command(sid, command.partition(" ")[2],
                                                             request_profile=_get_active_profile_name())})
 
+        if command.split()[0].lower() in ("/review", "review"):
+            from api.review import run_review_command
+            return j(handler, {"output": run_review_command(sid, command.partition(" ")[2],
+                                                            request_profile=_get_active_profile_name())})
+
         try:
             return j(handler, {"output": execute_agent_command(command)})
         except KeyError:

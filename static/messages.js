@@ -5,7 +5,7 @@ const _AGENT_COMMAND_ALIASES = {
   'credits': 'credits'
 };
 const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set([
-  'reload-mcp','reload-skills','codex-runtime','credits','refine',
+  'reload-mcp','reload-skills','codex-runtime','credits','refine','review',
   'reload_mcp','reload_skills','codex_runtime','credits'
 ]);
 function _markSessionViewed(sid, messageCount) {
@@ -1540,14 +1540,23 @@ async function send(){
       // or queued as the literal text "/stop" (#6951).
       if(text.startsWith('/')&&!literalSlash){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
+<<<<<<< HEAD
         if(_pc&&_pc.name==='refine'&&typeof executeAgentCommand==='function'){
           // /refine must reach the exec endpoint while a turn is running: the
+=======
+        if(_pc&&_pc.name==='review'&&typeof executeAgentCommand==='function'){
+          // /review must reach the exec endpoint while a turn is running: the
+>>>>>>> feat(commands): run /review from the WebUI via the shared review engine
           // backend answers with its "wait for the turn" refusal instead of the
           // text falling through to steer/queue routing.
           $('msg').value='';autoResize();
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           let _out;
+<<<<<<< HEAD
           try{_out=await executeAgentCommand(text,{name:'refine'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
+=======
+          try{_out=await executeAgentCommand(text,{name:'review'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
+>>>>>>> feat(commands): run /review from the WebUI via the shared review engine
           S.messages.push({role:'assistant',content:String(_out||'(no output)'),_ts:Date.now()/1000});
           if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
           return;

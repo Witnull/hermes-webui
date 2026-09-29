@@ -1079,21 +1079,27 @@ def test_busy_stop_executes_real_cancel_branch():
         const r1 = await busyIntercept('/stop', false);
         const r2 = await busyIntercept('/agents', false);
         const r3 = await busyIntercept('/refine', false);
-        return { stop: r1, agents: r2, refine: r3 };
+        const r4 = await busyIntercept('/review', false);
+        return { stop: r1, agents: r2, refine: r3, review: r4 };
         """
     )
     # /stop is intercepted by the busy branch (cmdStop -> cancelStream ran,
     # mode routing never reached), /agents is NOT a busy-control command so it
     # falls through to mode routing (documented: it is no longer announced),
-    # and /refine reaches the exec endpoint from a busy chat (the backend
+    # and /refine and /review reach the exec endpoint from a busy chat (the backend
     # answers with its "wait for the turn" refusal instead of the text being
     # steered or queued).
     assert out["result"]["stop"] == {"intercepted": True}
     assert out["result"]["agents"] == {"intercepted": False}
     assert out["result"]["refine"] == {"intercepted": True}
+    assert out["result"]["review"] == {"intercepted": True}
     assert any(c.startswith("cancelStream:slash-stop") for c in out["calls"]), out["calls"]
     assert any(
         c == 'api:/api/commands/exec {"command":"/refine","session_id":"sess-1"}'
+        for c in out["calls"]
+    ), out["calls"]
+    assert any(
+        c == 'api:/api/commands/exec {"command":"/review","session_id":"sess-1"}'
         for c in out["calls"]
     ), out["calls"]
     assert not any(c.startswith("steer") for c in out["calls"]), out["calls"]
