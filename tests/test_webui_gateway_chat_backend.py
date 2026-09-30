@@ -1972,3 +1972,25 @@ def test_gateway_chat_worker_emits_title_from_state_db(tmp_path):
     finally:
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+
+
+def test_gateway_tool_full_args_and_result_supersede_preview():
+    _, started = _gateway_tool_progress_event({
+        "event": "tool.started", "tool": "terminal", "preview": "npm ci + 1 command",
+        "args": {"command": "cd /repo && npm ci && npm test"},
+    })
+    assert started["args"] == {"command": "cd /repo && npm ci && npm test"}
+    assert "display_command" not in started
+    long_out = "x" * 3000
+    _, completed = _gateway_tool_progress_event({
+        "event": "tool.completed", "tool": "terminal", "preview": long_out[:497] + "...",
+        "result": {"output": long_out, "exit_code": 0},
+    })
+    assert completed["snippet"] == long_out
+
+
+def test_gateway_tool_completed_without_result_keeps_preview_only():
+    _, completed = _gateway_tool_progress_event(
+        {"event": "tool.completed", "tool": "terminal", "preview": "short"}
+    )
+    assert "snippet" not in completed and completed["preview"] == "short"
