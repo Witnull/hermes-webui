@@ -96,3 +96,39 @@ def test_unusable_forwarded_value_keys_on_socket_peer(path, trust_forwarded, pee
         assert _login(path, peer, {header: value}) == 401
 
     assert _login(path, peer, {header: values[-1]}) == 429
+
+
+@pytest.mark.parametrize("path", LOGIN_PATHS)
+@pytest.mark.parametrize("real_ip", ["198.51.100.9", "not-an-ip"])
+def test_rotating_xff_with_fixed_real_ip_keys_on_socket_peer(path, real_ip, monkeypatch):
+    # The proxy sets X-Real-IP but passes the client's own X-Forwarded-For through.
+    monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "10.0.0.5/32")
+    for i in range(auth._LOGIN_MAX_ATTEMPTS):
+        headers = {"X-Forwarded-For": f"203.0.113.{i}", "X-Real-IP": real_ip}
+        assert _login(path, "10.0.0.5", headers) == 401
+
+    headers = {"X-Forwarded-For": "203.0.113.99", "X-Real-IP": real_ip}
+    assert _login(path, "10.0.0.5", headers) == 429
+
+
+@pytest.mark.parametrize("path", LOGIN_PATHS)
+@pytest.mark.parametrize(
+    "forwarded, real_ip",
+    [
+        ("203.0.113.10", "203.0.113.10"),
+        ("2001:DB8::1", "2001:db8:0:0:0:0:0:1"),
+        # An appending proxy keeps whatever the client sent to the left.
+        ("1.1.1.1, 203.0.113.10", "203.0.113.10"),
+    ],
+)
+def test_xff_agreeing_with_real_ip_keeps_per_client_buckets(path, forwarded, real_ip, monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "10.0.0.5/32")
+    client = {"X-Forwarded-For": forwarded, "X-Real-IP": real_ip}
+    for _ in range(auth._LOGIN_MAX_ATTEMPTS):
+        assert _login(path, "10.0.0.5", client) == 401
+
+    assert _login(path, "10.0.0.5", client) == 429
+    other = {"X-Forwarded-For": "203.0.113.20", "X-Real-IP": "203.0.113.20"}
+    assert _login(path, "10.0.0.5", other) == 401

@@ -7035,8 +7035,15 @@ def _login_client_ip(handler) -> str:
     HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and the raw peer is listed in
     HERMES_WEBUI_TRUSTED_PROXY_CIDRS. Implicit loopback trust is not enough:
     a direct loopback or SSH-tunnel client could otherwise send a new
-    X-Forwarded-For on every attempt. Fall back to the raw peer whenever the
-    result is not an IP address.
+    X-Forwarded-For on every attempt. Listing a loopback address in
+    HERMES_WEBUI_TRUSTED_PROXY_CIDRS trusts every local client (an SSH tunnel,
+    another local process) exactly like the proxy, because the address cannot
+    tell a same-host proxy from a same-host client.
+
+    When both X-Forwarded-For and X-Real-IP are present they must resolve to the
+    same address. Otherwise the proxy is passing the client's own
+    X-Forwarded-For through and the client could pick its bucket. Fall back to
+    the raw peer whenever they differ or a value is not an IP address.
     """
     import ipaddress
 
@@ -7044,7 +7051,11 @@ def _login_client_ip(handler) -> str:
         try:
             peer = ipaddress.ip_address(_request_client_ip(handler))
             if _ip_in_networks(peer, _trusted_proxy_networks(include_loopback=False)):
-                return str(ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler)))
+                client = ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler))
+                xff = handler.headers.get("X-Forwarded-For")
+                real_ip = handler.headers.get("X-Real-IP", "").strip()
+                if not (xff and real_ip) or client == ipaddress.ip_address(real_ip):
+                    return str(client)
         except ValueError:
             pass
     return _client_ip_for_rate_limit(handler)
