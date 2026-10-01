@@ -3,6 +3,7 @@ Hermes Web UI -- SSE streaming engine and agent thread runner.
 Includes Sprint 10 cancel support via CANCEL_FLAGS.
 """
 import base64
+import collections
 import contextlib
 import contextvars
 import json
@@ -4336,10 +4337,12 @@ def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
     """Map this turn's assistant step positions to their tool call IDs, in order.
 
     ``prev_asst`` assistant messages belong to prior turns and are skipped.
+    ``started_ids`` lists every live tool start in order; an ID repeats when two
+    steps reuse it (agents derive IDs deterministically when providers omit them).
 
     IDs come from the step's ``tool_calls``, else its following tool results.
-    Every explicit ID in the turn is reserved first; ID-less results then take
-    the remaining live starts in order, but only when the counts match
+    Every explicit ID occurrence in the turn is reserved first; ID-less results
+    then take the remaining live starts in order, but only when the counts match
     one-to-one. Otherwise they stay unbound: misattribution is worse than loss.
     """
     step_ids, idless = {}, []
@@ -4356,8 +4359,13 @@ def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
                 else:
                     idless.append(pos)
         step_ids[pos] = ids
-    reserved = {i for ids in step_ids.values() for i in ids}
-    remaining = [i for i in started_ids if i not in reserved]
+    reserved = collections.Counter(i for ids in step_ids.values() for i in ids)
+    remaining = []
+    for call_id in started_ids:
+        if reserved[call_id]:
+            reserved[call_id] -= 1
+        else:
+            remaining.append(call_id)
     if idless and len(idless) == len(remaining):
         for pos, call_id in zip(idless, remaining, strict=True):
             step_ids[pos].append(call_id)
@@ -4370,9 +4378,11 @@ def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, op
 
     ``interim_segments`` is consumed in order: a step whose content holds an
     interim message's visible text takes the segment bound to it (earlier
-    unmatched interims are dropped).
+    unmatched interims are dropped). ``tool_call_segments`` maps an ID to its
+    per-start segments; each step consumes the oldest one, so a repeated ID
+    resolves in step order.
     """
-    bound = [tool_call_segments[i] for i in call_ids if i in tool_call_segments]
+    bound = [tool_call_segments[i].pop(0) for i in call_ids if tool_call_segments.get(i)]
     content = msg.get('content')
     interim = None
     compact = _compact_for_echo_compare(content) if isinstance(content, str) else ''
@@ -4394,13 +4404,14 @@ def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, op
 
 
 def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
-                           tool_call_segments=None, open_segment=None, interim_segments=None):
+                           tool_call_segments=None, open_segment=None, interim_segments=None,
+                           tool_start_order=None):
     """Persist per-step reasoning on this turn's assistant messages in ``s.messages``.
 
     Contract (docs/sse-streams.md, "Reasoning settlement"): non-empty agent
     ``reasoning`` wins; otherwise the stream segment the step owns is used.
-    Ownership comes from ``tool_call_segments`` (tool_call_id -> segment index,
-    bound when the tool starts), ``interim_segments`` ((compact visible text,
+    Ownership comes from ``tool_call_segments`` (tool_call_id -> segment index
+    per start of that ID, in start order), ``interim_segments`` ((compact visible text,
     segment index) per interim message, bound when it is delivered) and
     ``open_segment`` (the final step's segment), so a step that streamed no
     thinking never inherits a neighbour's segment.
@@ -4410,7 +4421,7 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
     # gets its own trace; skip prior-turn messages (multi-turn off-by-N).
     if not s.messages:
         return
-    tool_call_segments = tool_call_segments or {}
+    tool_call_segments = {k: list(v) for k, v in (tool_call_segments or {}).items()}
     interim_segments = list(interim_segments or [])
     _positional = not tool_call_segments and not interim_segments
     _prev_asst = sum(
@@ -4419,8 +4430,7 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
     )
     _total_asst = sum(1 for m in s.messages if isinstance(m, dict) and m.get('role') == 'assistant')
     _asst_count = 0
-    # dict order = tool start order
-    _step_ids = _turn_step_tool_call_ids(s.messages, _prev_asst, list(tool_call_segments))
+    _step_ids = _turn_step_tool_call_ids(s.messages, _prev_asst, list(tool_start_order or []))
     _pos = -1
     for _rm in s.messages:
         _pos += 1
@@ -11801,11 +11811,13 @@ def _run_agent_streaming(
             _reasoning_buffer_index = _CompactEchoIndex()
             _current_reasoning_idx = 0
             _tool_boundary_advanced = False
-            # Segment ownership: tool_call_id -> segment streamed before that call
-            # (None = its step streamed no thinking); interim -> (compact visible
+            # Segment ownership: tool_call_id -> segment streamed before each start
+            # of that ID (None = its step streamed no thinking; IDs can repeat
+            # across steps); interim -> (compact visible
             # text, segment) per delivered interim message; unbound = the open
             # step's segment.
             _tool_call_reasoning_idx: dict = {}
+            _tool_start_order: list = []
             _interim_reasoning_idx: list = []
             _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
@@ -12260,9 +12272,10 @@ def _run_agent_streaming(
                     return
 
             def on_tool_start(tool_call_id, name, args):
-                if tool_call_id and tool_call_id not in _tool_call_reasoning_idx:
-                    _tool_call_reasoning_idx[tool_call_id] = _unbound_reasoning_idx[0]
-                    _unbound_reasoning_idx[0] = None
+                if tool_call_id:
+                    _tool_call_reasoning_idx.setdefault(tool_call_id, []).append(_unbound_reasoning_idx[0])
+                    _tool_start_order.append(tool_call_id)
+                _unbound_reasoning_idx[0] = None
                 try:
                     _record_live_tool_start(tool_call_id, name, args)
                     if tool_call_id and tool_call_id not in _live_tool_event_start_ids:
@@ -14106,6 +14119,7 @@ def _run_agent_streaming(
                 _settle_turn_reasoning(
                     s, _previous_messages, _reasoning_segments,
                     _tool_call_reasoning_idx, _unbound_reasoning_idx[0], _interim_reasoning_idx,
+                    _tool_start_order,
                 )
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))

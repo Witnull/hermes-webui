@@ -42,7 +42,8 @@ def test_agent_reasoning_wins_over_drifted_segments():
         _tool_step('c3', 'think C'), _tool_result('c3'),
         {'role': 'assistant', 'content': 'done', 'reasoning': None},
     ])
-    _settle_turn_reasoning(s, prior, {0: 'think A', 1: 'think C'}, {'c1': 0, 'c2': None, 'c3': 1}, None)
+    _settle_turn_reasoning(s, prior, {0: 'think A', 1: 'think C'}, {'c1': [0], 'c2': [None], 'c3': [1]}, None,
+                           tool_start_order=['c1', 'c2', 'c3'])
     assert _reasonings(s.messages) == ['old', 'think A', None, 'think C', None]
 
 
@@ -337,3 +338,16 @@ def test_start_without_persisted_result_leaves_idless_steps_unbound(cleanup_test
          {'role': 'assistant', 'content': 'done', 'reasoning': None}],
     )
     assert _reasonings(saved) == [None, None, None]
+
+
+def test_call_id_repeated_across_steps_keeps_reasoning_in_step_order(cleanup_test_sessions):
+    # deterministic_call_id() yields the same ID for an identical call at the
+    # same index in two responses ("run the same check again").
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'dup'), ('reasoning', 'think B'), ('tool', 'dup'),
+         ('token', 'done')],
+        [_tool_step('dup', None), _tool_result('dup'),
+         _tool_step('dup', None), _tool_result('dup'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'think B', None]

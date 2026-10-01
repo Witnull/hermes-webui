@@ -85,6 +85,9 @@ earlier turns are never modified.
 - **Stream segments are bound to the step that owns them.** When a tool
   starts, `on_tool_start()` binds its `tool_call_id` to the segment streamed
   since the previous tool, or to `None` if that step streamed no thinking.
+  Each start is bound separately: an id repeated across steps (agents derive
+  ids deterministically when providers omit them) keeps one binding per start,
+  and settlement consumes them in step order.
   A visible interim message (`on_interim_assistant()`) also closes its step:
   the open segment is bound to that message's text, so the next tool call
   cannot claim it. Settlement resolves a tool-call step through its call ids:
