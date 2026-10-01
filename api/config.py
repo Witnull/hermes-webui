@@ -4995,6 +4995,16 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     if provider == config_provider:
         return model
 
+    # The picker reports a configured provider that aliases to the generic
+    # ``custom`` lane (``local``, or ``ollama`` through the agent's alias table)
+    # as ``custom``, so the session's ``custom`` IS the configured provider even
+    # though the raw strings differ. Qualifying it would mint
+    # ``@custom:qwen3.8:27b``, whose tag prefix resolve_model_provider() reads
+    # as a named-provider slug (``custom:qwen3.8``). (#7955)
+    if provider == "custom" and config_provider:
+        if str(_resolve_provider_alias(config_provider) or "").strip().lower() == "custom":
+            return model
+
     # OpenRouter selections with slash IDs are explicit provider/model paths.
     if provider == "openrouter":
         return f"@{provider}:{model}"
