@@ -120,8 +120,15 @@ def _redact_share_paths(text: str, extra_paths) -> str:
 # Excludes MEDIA: followed by http/https URLs so external images pass
 # through unchanged.  file:// references are NOT matched here — they are
 # always rejected at the public-share boundary (absolute, un-scoped).
+# `data:` URIs are also excluded: a MEDIA:data:image/...;base64,<blob>
+# token is already a self-contained inline image, not a local file path, so
+# it must never reach the filesystem resolver — feeding a multi-KB base64
+# blob to Path(...).resolve()/stat() raised OSError ENAMETOOLONG (errno 36)
+# and 500'd share creation (#7949). The share page's client-side renderMd()
+# renders data:image/* tokens as inline <img> directly, so passing the token
+# through unchanged is both crash-free and correct.
 _SHARE_MEDIA_RE = re.compile(
-    r"MEDIA:(?!https?://)([^\s\)\]>]+)"
+    r"MEDIA:(?!https?://)(?!data:)([^\s\)\]>]+)"
 )
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
@@ -266,27 +273,38 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         if raw.startswith("file://"):
             return None
 
+        # Defensive length / newline guard (#7949). A real local attachment
+        # path is short; an over-long or newline-bearing token (e.g. a
+        # data:...;base64,<blob> URI that slipped past the caller) is never a
+        # valid file and must never be handed to the filesystem — a stat() on
+        # an over-length path raises OSError ENAMETOOLONG (errno 36), and that
+        # stat happens inside .is_file() below, OUTSIDE the resolve()
+        # try/except, so the error would otherwise escape and 500 the caller.
+        # 4096 comfortably exceeds any real PATH_MAX-bounded attachment path.
+        if len(raw) > 4096 or "\n" in raw or "\x00" in raw:
+            return None
+
         # --- Absolute paths: resolve as-is, then allow-list check ------------
         if raw.startswith("/") or raw.startswith("~"):
             try:
                 p = Path(raw).expanduser().resolve(strict=False)
+                if not allowed or not any(p.is_relative_to(r) for r in allowed):
+                    return None
+                return p if p.is_file() else None
             except (OSError, ValueError, RuntimeError):
                 return None
-            if not allowed or not any(p.is_relative_to(r) for r in allowed):
-                return None
-            return p if p.is_file() else None
 
         # --- Relative paths: try each allowed root as the anchor -------------
         for root in allowed:
             try:
                 candidate = (root / raw).resolve(strict=False)
+                # Path traversal guard: resolved path must still be under root.
+                if not candidate.is_relative_to(root):
+                    continue
+                if candidate.is_file():
+                    return candidate
             except (OSError, ValueError, RuntimeError):
                 continue
-            # Path traversal guard: resolved path must still be under the root.
-            if not candidate.is_relative_to(root):
-                continue
-            if candidate.is_file():
-                return candidate
         return None
 
     def _replace_ref(m: re.Match) -> str:
