@@ -3213,6 +3213,15 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     parsed_provider_hint = _parse_provider_qualified_model_id(model_id)
     if parsed_provider_hint is not None:
         bare_model, provider_hint = parsed_provider_hint
+        # ``@local:`` names the legacy ``provider: local`` profile, which is
+        # healed to ``custom`` above. Return the healed route: ``local`` itself
+        # is not a registered provider (#1384, #7955).
+        if (
+            provider_hint.strip().lower() == "local"
+            and isinstance(model_cfg, dict)
+            and str(model_cfg.get("provider") or "").strip().lower() == "local"
+        ):
+            return _finalize(bare_model, config_provider, config_base_url)
         # Session/send/handoff shapes encode the provider as @custom:<slug>:model
         # and reach here after the ownership scan only saw the ENCODED string.
         # _finalize() applies the all-entry uniqueness check before returning the
@@ -4998,12 +5007,16 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     # The picker reports a configured provider that aliases to the generic
     # ``custom`` lane (``local``, or ``ollama`` through the agent's alias table)
     # as ``custom``, so the session's ``custom`` IS the configured provider even
-    # though the raw strings differ. Qualifying it would mint
+    # though the raw strings differ. Qualifying it as ``custom`` would mint
     # ``@custom:qwen3.8:27b``, whose tag prefix resolve_model_provider() reads
-    # as a named-provider slug (``custom:qwen3.8``). (#7955)
+    # as a named-provider slug (``custom:qwen3.8``). A bare id is not safe
+    # either: it goes through the custom_providers[] / providers: ownership
+    # scans, so another endpoint listing the same id would take the request.
+    # Name the configured provider instead, which skips those scans and keeps
+    # ``model.base_url`` authoritative. (#7955)
     if provider == "custom" and config_provider:
         if str(_resolve_provider_alias(config_provider) or "").strip().lower() == "custom":
-            return model
+            return f"@{config_provider}:{model}"
 
     # OpenRouter selections with slash IDs are explicit provider/model paths.
     if provider == "openrouter":
