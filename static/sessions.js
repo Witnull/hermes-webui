@@ -8715,10 +8715,19 @@ function renderSessionListFromCache(){
   const unpinned=orderedSessions.filter(s=>!s.pinned);
   // Date grouping: Pinned / Today / Yesterday / This week / Last week / Older
   const now=_serverNowMs();
-  // Collapse state persisted in localStorage
-  let _groupCollapsed={};
-  try{_groupCollapsed=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}');}catch(e){}
-  const _saveCollapsed=()=>{try{localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));}catch(e){}};
+  // Collapse state: in-memory authority, localStorage as best-effort
+  // persistence. If the write fails (quota, blocked storage) the toggle must
+  // still take effect for this session instead of silently reverting (#7953).
+  if(!window.__hermesDateGroupCollapsed){
+    let stored={};
+    try{stored=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}')||{};}catch(e){}
+    window.__hermesDateGroupCollapsed=stored;
+  }
+  const _groupCollapsed=window.__hermesDateGroupCollapsed;
+  const _saveCollapsed=()=>{
+    try{localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));}
+    catch(e){ if(typeof console!=='undefined'&&console.warn) console.warn('hermes: date-group collapse state could not be persisted', e); }
+  };
   // Group sessions by date
   const groups=[];
   let curLabel=null,curItems=[];
