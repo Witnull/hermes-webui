@@ -260,3 +260,13 @@ def test_long_host_and_alt_keep_the_tooltip(driver):
     url = f"https://{host}/c.png"
     out = _run(driver, md={"md": f"![{'A' * 120}]({url})"})
     assert 'title="Remote image not loaded automatically. Opens ' + host in out["md:md"]
+
+
+def test_sanitizer_rejects_overlong_alt_suffix_tooltip(driver):
+    url = "https://images.example-blog.net/chart.png"
+    reason = "Remote image not loaded automatically. Opens images.example-blog.net in a new tab."
+    ok = f'<a class="msg-media-link" href="{url}" title="{reason} ({"a" * 120})">x</a>'
+    bad = f'<a class="msg-media-link" href="{url}" title="{reason} ({"a" * 400})">x</a>'
+    out = _run(driver, md={"ok": ok, "bad": bad})
+    assert 'title="' in out["md:ok"]
+    assert 'title="' not in out["md:bad"]

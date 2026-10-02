@@ -8590,7 +8590,8 @@ function renderMd(raw){
         const reason=/^https?:\/\//i.test(href)&&!_remoteImageAllowed(href)?_remoteImageReason(href):'';
         // Exactly the shapes _remoteImagePlaceholderHtml emits: the reason, or the
         // reason followed by " (<alt>)".
-        if(reason&&(tip===reason||(tip.startsWith(reason+' (')&&tip.endsWith(')')))){
+        // The producer caps alt at 120 chars; re-admit no longer suffix than that.
+        if(reason&&(tip===reason||(tip.startsWith(reason+' (')&&tip.endsWith(')')&&tip.length<=reason.length+123))){
           tipAttr=` title="${esc(tip)}"`;
         }
       }
