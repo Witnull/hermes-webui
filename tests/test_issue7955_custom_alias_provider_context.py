@@ -10,11 +10,16 @@ compared the two raw strings, saw a mismatch, and emitted
 ``@custom:qwen3.8:27b``. ``resolve_model_provider()`` then read the tag
 prefix as a named-provider slug: provider ``custom:qwen3.8``, model ``27b``.
 
-The fix names the configured provider in the hint (``@ollama:qwen3.8:27b``)
-when the session provider is ``custom`` and the configured provider aliases
-to ``custom``. A bare id would also fix the parse, but it runs through the
-``custom_providers[]`` / ``providers:`` ownership scans, where another
-endpoint listing the same id takes the request away from ``model.base_url``.
+The fix gives that lane its own route hint, ``@custom-configured:<model>``,
+which ``resolve_model_provider()`` maps to ``(model, "custom",
+model.base_url)`` before it looks anything up by name. Two simpler shapes were
+tried and reviewed out:
+
+* a bare id runs through the ``custom_providers[]`` / ``providers:`` ownership
+  scans, where another endpoint listing the same id takes the request;
+* the configured provider's own hint (``@ollama:<model>``) skips those scans
+  but picks up a ``providers.ollama`` or ``custom_providers[name=local]``
+  record of the same name, which the Custom lane never used.
 
 ``ollama -> custom`` lives in the agent's alias table
 (``hermes_cli.models._PROVIDER_ALIASES``), which the WebUI merges when the
@@ -70,13 +75,13 @@ def agent_aliases_ollama_to_custom(monkeypatch):
 # ── The reported bug: provider ollama + base_url, colon-tagged model ─────
 
 
-def test_ollama_default_names_the_configured_provider_not_custom(
+def test_ollama_default_gives_the_custom_lane_its_own_hint(
     agent_aliases_ollama_to_custom,
 ):
     old = _set_config(provider="ollama", base_url=OLLAMA_BASE_URL, default="qwen3.8:27b")
     try:
         encoded = config.model_with_provider_context("qwen3.8:27b", "custom")
-        assert encoded == "@ollama:qwen3.8:27b", (
+        assert encoded == "@custom-configured:qwen3.8:27b", (
             f"session 'custom' is the configured provider here, got {encoded!r}"
         )
     finally:
@@ -121,7 +126,7 @@ def test_legacy_local_default_colon_tagged_model_roundtrip():
     old = _set_config(provider="local", base_url=OLLAMA_BASE_URL, default="qwen3.8:27b")
     try:
         encoded = config.model_with_provider_context("qwen3.8:27b", "custom")
-        assert encoded == "@local:qwen3.8:27b", f"got {encoded!r}"
+        assert encoded == "@custom-configured:qwen3.8:27b", f"got {encoded!r}"
         model, provider, base_url = config.resolve_model_provider(encoded)
         assert (model, provider, base_url) == ("qwen3.8:27b", "custom", OLLAMA_BASE_URL)
     finally:
@@ -158,7 +163,7 @@ def test_ollama_default_duplicate_id_keeps_configured_endpoint(
         resolved = config.resolve_model_provider(
             config.model_with_provider_context(model_id, "custom")
         )
-        assert resolved == (model_id, "ollama", OLLAMA_BASE_URL), (
+        assert resolved == (model_id, "custom", OLLAMA_BASE_URL), (
             f"{model_id!r} from the Ollama lane resolved to {resolved!r}"
         )
     finally:
@@ -168,8 +173,8 @@ def test_ollama_default_duplicate_id_keeps_configured_endpoint(
 @pytest.mark.parametrize("shape", ["custom_providers", "providers"])
 @pytest.mark.parametrize("model_id", LAB_MODELS)
 def test_legacy_local_default_duplicate_id_keeps_configured_endpoint(shape, model_id):
-    """``local`` is not a registered provider (#1384), so the route still
-    comes back healed to ``custom``, never as ``local``."""
+    """``local`` is not a registered provider (#1384): the route comes back as
+    ``custom``, never as ``local``."""
     old = _set_config(provider="local", base_url=OLLAMA_BASE_URL, **_lab(shape))
     try:
         resolved = config.resolve_model_provider(
@@ -188,7 +193,106 @@ def test_ollama_default_model_only_on_ollama_roundtrip(agent_aliases_ollama_to_c
         resolved = config.resolve_model_provider(
             config.model_with_provider_context("llama3", "custom")
         )
-        assert resolved == ("llama3", "ollama", OLLAMA_BASE_URL)
+        assert resolved == ("llama3", "custom", OLLAMA_BASE_URL)
+    finally:
+        _restore(old)
+
+
+# ── A record named like the configured provider is not the Custom lane ───
+#
+# The Custom lane is bound to ``model.base_url``. A ``providers.<name>`` or
+# ``custom_providers[]`` record that happens to carry the configured
+# provider's name has its own endpoint and its own key, and must not be
+# picked up by a ``custom`` session, tagged or untagged.
+
+OTHER_BASE_URL = "http://other.example:9999/v1"
+
+
+def _custom_lane(model_id):
+    return config.resolve_model_provider(
+        config.model_with_provider_context(model_id, "custom")
+    )
+
+
+@pytest.mark.parametrize("model_id", ["llama3", "qwen3.8:27b"])
+def test_ollama_default_ignores_a_providers_record_named_ollama(
+    agent_aliases_ollama_to_custom, model_id
+):
+    old = _set_config(
+        provider="ollama",
+        base_url=OLLAMA_BASE_URL,
+        providers={"ollama": {"base_url": OTHER_BASE_URL}},
+    )
+    try:
+        assert _custom_lane(model_id) == (model_id, "custom", OLLAMA_BASE_URL)
+    finally:
+        _restore(old)
+
+
+@pytest.mark.parametrize("model_id", ["llama3", "qwen3.8:27b"])
+def test_legacy_local_default_ignores_a_providers_record_named_local(model_id):
+    old = _set_config(
+        provider="local",
+        base_url=OLLAMA_BASE_URL,
+        providers={"local": {"base_url": OTHER_BASE_URL}},
+    )
+    try:
+        assert _custom_lane(model_id) == (model_id, "custom", OLLAMA_BASE_URL)
+    finally:
+        _restore(old)
+
+
+@pytest.mark.parametrize("model_id", ["llama3", "qwen3.8:27b"])
+def test_legacy_local_default_ignores_a_custom_provider_named_local(model_id):
+    """Neither that record's endpoint nor its key: the route is the bare
+    ``custom`` lane, which no named record's credential answers for."""
+    old = _set_config(
+        provider="local",
+        base_url=OLLAMA_BASE_URL,
+        custom_providers=[
+            {"name": "local", "base_url": "http://named.example:7777/v1", "api_key": "sk-named"}
+        ],
+    )
+    try:
+        model, provider, base_url = _custom_lane(model_id)
+        assert (model, provider, base_url) == (model_id, "custom", OLLAMA_BASE_URL)
+        assert config.resolve_custom_provider_connection(provider) == (None, None)
+    finally:
+        _restore(old)
+
+
+def test_an_explicit_pick_from_providers_local_keeps_its_own_record():
+    """``@local:phi-5`` is a pick from the ``providers.local`` row, not the
+    Custom lane, so it is routed by that record as before."""
+    old = _set_config(
+        provider="local",
+        base_url=OLLAMA_BASE_URL,
+        providers={"local": {"base_url": "http://explicit.example:8000/v1"}},
+    )
+    try:
+        assert config.resolve_model_provider("@local:phi-5") == (
+            "phi-5",
+            "local",
+            "http://explicit.example:8000/v1",
+        )
+    finally:
+        _restore(old)
+
+
+def test_an_explicit_pick_from_providers_ollama_keeps_its_own_record(
+    agent_aliases_ollama_to_custom,
+):
+    old = _set_config(
+        provider="ollama",
+        base_url=OLLAMA_BASE_URL,
+        providers={"ollama": {"base_url": OTHER_BASE_URL}},
+    )
+    try:
+        assert config.resolve_model_provider("@ollama:llama3") == (
+            "llama3",
+            "ollama",
+            OTHER_BASE_URL,
+        )
     finally:
         _restore(old)
 

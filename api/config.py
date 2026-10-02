@@ -2803,6 +2803,13 @@ def _looks_like_model_tag(candidate: str) -> bool:
     return False
 
 
+# Route hint for a ``custom`` session under a configured provider that aliases
+# to ``custom`` (``ollama``, legacy ``local``). Internal to
+# model_with_provider_context() -> resolve_model_provider(); it is not a
+# provider id and is never persisted or shown.
+_CONFIGURED_CUSTOM_LANE_PREFIX = "@custom-configured:"
+
+
 def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
     """Parse WebUI's ``@provider:model`` route hint into ``(model, provider)``.
 
@@ -3030,6 +3037,16 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     if not model_id:
         return _finalize(model_id, config_provider, config_base_url)
 
+    # The Custom lane of the configured endpoint (#7955). It is bound to
+    # ``model.base_url`` and answered before anything is looked up by name: a
+    # ``providers.<name>`` or ``custom_providers[]`` record that carries the
+    # configured provider's name, or lists the same model id, has its own
+    # endpoint and credential and is not this lane.
+    if model_id.startswith(_CONFIGURED_CUSTOM_LANE_PREFIX):
+        return _finalize(
+            model_id[len(_CONFIGURED_CUSTOM_LANE_PREFIX):], "custom", config_base_url
+        )
+
     # Custom providers declared in config.yaml should win over slash-based
     # OpenRouter heuristics. Their model IDs commonly contain '/' too.
     # However, when the active provider is an explicit non-custom provider and
@@ -3213,15 +3230,6 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     parsed_provider_hint = _parse_provider_qualified_model_id(model_id)
     if parsed_provider_hint is not None:
         bare_model, provider_hint = parsed_provider_hint
-        # ``@local:`` names the legacy ``provider: local`` profile, which is
-        # healed to ``custom`` above. Return the healed route: ``local`` itself
-        # is not a registered provider (#1384, #7955).
-        if (
-            provider_hint.strip().lower() == "local"
-            and isinstance(model_cfg, dict)
-            and str(model_cfg.get("provider") or "").strip().lower() == "local"
-        ):
-            return _finalize(bare_model, config_provider, config_base_url)
         # Session/send/handoff shapes encode the provider as @custom:<slug>:model
         # and reach here after the ownership scan only saw the ENCODED string.
         # _finalize() applies the all-entry uniqueness check before returning the
@@ -5012,11 +5020,12 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     # as a named-provider slug (``custom:qwen3.8``). A bare id is not safe
     # either: it goes through the custom_providers[] / providers: ownership
     # scans, so another endpoint listing the same id would take the request.
-    # Name the configured provider instead, which skips those scans and keeps
-    # ``model.base_url`` authoritative. (#7955)
+    # Nor is the configured provider's own hint (``@ollama:``), which picks up
+    # a same-named providers: / custom_providers[] record. The lane gets its
+    # own hint, resolved to ``model.base_url`` before any lookup. (#7955)
     if provider == "custom" and config_provider:
         if str(_resolve_provider_alias(config_provider) or "").strip().lower() == "custom":
-            return f"@{config_provider}:{model}"
+            return f"{_CONFIGURED_CUSTOM_LANE_PREFIX}{model}"
 
     # OpenRouter selections with slash IDs are explicit provider/model paths.
     if provider == "openrouter":
