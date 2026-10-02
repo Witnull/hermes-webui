@@ -9,6 +9,7 @@ links do not leak local workspace paths, profile details, or raw tool payloads.
 from __future__ import annotations
 
 import base64
+import binascii
 import html
 import io
 import json
@@ -120,16 +121,28 @@ def _redact_share_paths(text: str, extra_paths) -> str:
 # Excludes MEDIA: followed by http/https URLs so external images pass
 # through unchanged.  file:// references are NOT matched here — they are
 # always rejected at the public-share boundary (absolute, un-scoped).
-# `data:` URIs are also excluded: a MEDIA:data:image/...;base64,<blob>
-# token is already a self-contained inline image, not a local file path, so
-# it must never reach the filesystem resolver — feeding a multi-KB base64
-# blob to Path(...).resolve()/stat() raised OSError ENAMETOOLONG (errno 36)
-# and 500'd share creation (#7949). The share page's client-side renderMd()
-# renders data:image/* tokens as inline <img> directly, so passing the token
-# through unchanged is both crash-free and correct.
+# `data:` URIs DO match: _replace_ref() routes them to _embed_share_data_uri(),
+# which applies the same public-share policy as a local file (raster MIME
+# allow-list, byte cap, magic-byte check) and never touches the filesystem.
+# Feeding a multi-KB base64 blob to Path(...).resolve()/stat() raised OSError
+# ENAMETOOLONG (errno 36) and 500'd share creation (#7949); passing every data:
+# URI through unchanged would instead republish arbitrary bytes (text/plain,
+# octet-stream, SVG) that credential redaction cannot see.
 _SHARE_MEDIA_RE = re.compile(
-    r"MEDIA:(?!https?://)(?!data:)([^\s\)\]>]+)"
+    r"MEDIA:(?!https?://)([^\s\)\]>]+)"
 )
+
+# Strict shape for an inline data URI: data:<type/subtype>[;param...];base64,<payload>.
+# Parameters (e.g. charset, name) are tolerated before the mandatory ;base64.
+_DATA_URI_RE = re.compile(
+    r"^data:(?P<mime>[a-z0-9.+-]+/[a-z0-9.+-]+)(?P<params>(?:;[^;,]*)*?);base64,(?P<payload>[A-Za-z0-9+/]*={0,2})$",
+    re.IGNORECASE,
+)
+# Normalise common aliases to the canonical names used by _SHARE_ALLOWED_MIME_TYPES.
+_DATA_URI_MIME_ALIASES = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg"}
+# Upper bound on the ENCODED payload, checked before decoding so an oversized
+# blob is refused without allocating its decoded bytes.
+_SHARE_EMBED_MAX_B64_CHARS = ((512 * 1024 + 2) // 3) * 4
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
 _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
@@ -243,6 +256,44 @@ def _sanitize_svg_bytes(data: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _embed_share_data_uri(raw: str) -> str:
+    """Validate an inline ``data:`` media reference for a public share.
+
+    Applies the same policy as an embedded local file: only the raster types in
+    ``_SHARE_ALLOWED_MIME_TYPES``, strictly valid base64, at most
+    ``_SHARE_EMBED_MAX_BYTES`` decoded, and magic bytes that match the declared
+    type. A valid image is re-emitted as a canonical ``<img>`` built from the
+    decoded bytes; anything else (non-image, SVG, malformed, oversized,
+    mismatched magic, non-base64) becomes ``_PLACEHOLDER`` so none of its bytes
+    reach the public snapshot. Never touches the filesystem (#7949).
+    """
+    if len(raw) > _SHARE_EMBED_MAX_B64_CHARS + 256:
+        return _PLACEHOLDER
+    m = _DATA_URI_RE.match(raw)
+    if not m:
+        return _PLACEHOLDER
+    mime_type = m.group("mime").lower()
+    mime_type = _DATA_URI_MIME_ALIASES.get(mime_type, mime_type)
+    if mime_type not in _SHARE_ALLOWED_MIME_TYPES:
+        return _PLACEHOLDER
+    payload = m.group("payload")
+    if not payload or len(payload) > _SHARE_EMBED_MAX_B64_CHARS:
+        return _PLACEHOLDER
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return _PLACEHOLDER
+    if not data or len(data) > _SHARE_EMBED_MAX_BYTES:
+        return _PLACEHOLDER
+    if not _check_image_magic(data, mime_type):
+        return _PLACEHOLDER
+    b64 = base64.b64encode(data).decode("ascii")
+    return (
+        f'<img src="data:{mime_type};base64,{b64}"'
+        f' class="msg-media-img" alt="image" loading="lazy">'
+    )
+
+
 def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> str:
     """Find local MEDIA: references and replace them with inline <img> tags.
 
@@ -315,6 +366,10 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         raw = raw.strip()
         if not raw:
             return m.group(0)
+
+        # --- Inline data: URI — validate in memory, never resolve as a path ---
+        if raw[:5].lower() == "data:":
+            return _embed_share_data_uri(raw) + suffix
 
         # --- Resolve and validate against allowed roots -----------------------
         p = _resolve_against_roots(raw)
