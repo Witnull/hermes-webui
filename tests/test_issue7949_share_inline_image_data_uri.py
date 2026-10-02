@@ -166,6 +166,8 @@ def test_resolver_rejects_overlong_token_without_raising(tmp_path: Path):
     raise, on an over-length / newline / NUL relative token."""
     ws = tmp_path / "workspace"
     ws.mkdir()
-    for raw in ("x" * 5000, "a\nb.png", "a\x00b.png"):
+    # "a"*300 + ".png" is under the 4096 guard but over NAME_MAX for one path
+    # component, so it exercises the is_file() probe moved inside try/except.
+    for raw in ("x" * 5000, "a" * 300 + ".png", "a\nb.png", "a\x00b.png"):
         out = _embed(f"MEDIA:{raw}", [ws])
         assert '<img src="data:' not in out
