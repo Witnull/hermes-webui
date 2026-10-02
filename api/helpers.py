@@ -312,6 +312,18 @@ def _csp_extra_img_src() -> str:
     return " " + " ".join(sources)
 
 
+def csp_img_extra_sources(extra_img_src: str | None = None) -> list[str]:
+    """Validated HERMES_WEBUI_CSP_IMG_EXTRA entries as a list, for the page config.
+
+    The renderer mirrors this list so a remote image outside the allowlist is
+    shown as an inert click-to-open link rather than a blocked <img>. Pass the
+    value already computed for the response's CSP header so the page and the
+    header always agree; ``None`` reads (and validates) the environment.
+    """
+    value = _csp_extra_img_src() if extra_img_src is None else extra_img_src
+    return value.split()
+
+
 def _csp_connect_src(extra_connect_src: str = "") -> str:
     return f"{_CSP_CONNECT_BASE} https://cdn.jsdelivr.net{extra_connect_src}"
 
@@ -357,7 +369,11 @@ def _security_headers(handler):
     """Add security headers to every response."""
     extra_connect_src = _csp_extra_connect_src()
     extra_frame_src = _csp_extra_frame_src()
-    extra_img_src = _csp_extra_img_src()
+    # A route that already embedded the image allowlist in its body (the app
+    # shell's window.__HERMES_CONFIG__.imgSrcExtra) pre-sets this attribute so
+    # the header and the page agree for this response; otherwise read it here.
+    preset_img_src = getattr(handler, "_csp_extra_img_src_preset", None)
+    extra_img_src = preset_img_src if isinstance(preset_img_src, str) else _csp_extra_img_src()
     handler._csp_extra_connect_src = extra_connect_src
     handler._csp_extra_frame_src = extra_frame_src
     handler._csp_extra_img_src = extra_img_src

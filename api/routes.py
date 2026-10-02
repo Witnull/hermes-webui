@@ -14268,9 +14268,21 @@ def handle_get(handler, parsed) -> bool:
 
             # The disk read + process-constant token substitutions are cached;
             # only the per-session CSRF token and per-request extension tags are
-            # applied here (see _render_index_shell_base).
-            html = _render_index_shell_base().replace(
-                "__CSRF_TOKEN_JSON__", json.dumps(csrf_token)
+            # applied here (see _render_index_shell_base). The CSP image
+            # allowlist is computed once and shared with the header via
+            # _csp_extra_img_src_preset, so the renderer's inert-placeholder
+            # decision always matches what the browser will enforce (#7941).
+            from api.helpers import _csp_extra_img_src, csp_img_extra_sources
+
+            extra_img_src = _csp_extra_img_src()
+            handler._csp_extra_img_src_preset = extra_img_src
+            html = (
+                _render_index_shell_base()
+                .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
+                .replace(
+                    "__CSP_IMG_EXTRA_JSON__",
+                    json.dumps(csp_img_extra_sources(extra_img_src)).replace("<", "\\u003c"),
+                )
             )
             return t(
                 handler,
