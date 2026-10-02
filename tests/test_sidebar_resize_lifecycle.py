@@ -12,6 +12,7 @@ and ``static/sessions.js`` in a browser harness, in the same style as
 """
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -83,6 +84,7 @@ __COLLAPSE_STATE__
 // best-effort, then re-render from the in-memory authority.
 window.__toggleGroup = (label) => {
   const state = window.__hermesDateGroupCollapsed;
+  _locallyToggled.add(label);
   state[label] = !state[label];
   _saveCollapsed();
   return state[label];
@@ -263,3 +265,88 @@ def test_date_group_toggle_survives_storage_denial(page):
         "() => { window.__reseedCollapseState(); return window.__hermesDateGroupCollapsed['YESTERDAY']; }"
     )
     assert reseeded is True, "re-seeding must not clobber the in-memory state from storage"
+
+
+def test_other_pointer_cancel_does_not_end_drag(page):
+    """Regression (Oct 2 re-gate): a pointercancel from an unrelated pointer
+    must not end the active resize.
+
+    Reviewer's sequence: capture failing, pointer 1 drags to +20px, pointer 2
+    (a pen or touch contact elsewhere) is cancelled, then pointer 1 moves to
+    +50px and releases — the drag must survive the foreign cancel.
+    """
+    _boot_resize(page, capture="throw")
+    _pointer(page, "pointerdown", x=100, pointer_id=1)
+    _pointer(page, "pointermove", target="#sidebar", x=120, pointer_id=1)
+    state = page.evaluate(STATE_JS)
+    assert state["width"] == "380px"
+
+    _pointer(page, "pointercancel", target="#sidebar", x=120, pointer_id=2)
+    state = page.evaluate(STATE_JS)
+    assert state["dragging"], "another pointer's cancel must not clear handle.dragging"
+    assert state["resizing"], "another pointer's cancel must not clear body.resizing"
+    assert state["width"] == "380px"
+
+    _pointer(page, "pointermove", target="#sidebar", x=150, pointer_id=1)
+    _pointer(page, "pointerup", target="body", x=150, pointer_id=1)
+    state = page.evaluate(STATE_JS)
+    assert not state["dragging"] and not state["resizing"]
+    assert state["width"] == "410px", "the drag must resume and finish after the foreign cancel"
+    assert state["stored"] == "410"
+
+
+def test_other_pointer_cancel_ignored_with_capture(page):
+    """The pointer-id guard applies on the capture-success path too."""
+    _boot_resize(page, capture="ok")
+    _pointer(page, "pointerdown", x=100, pointer_id=1)
+    _pointer(page, "pointermove", x=150, pointer_id=1)
+    _pointer(page, "pointercancel", x=150, pointer_id=2)  # on the handle
+    state = page.evaluate(STATE_JS)
+    assert state["dragging"] and state["resizing"]
+    assert state["width"] == "410px"
+    _pointer(page, "pointerup", x=150, pointer_id=1)
+    state = page.evaluate(STATE_JS)
+    assert not state["dragging"] and not state["resizing"]
+    assert state["stored"] == "410"
+
+
+def test_active_pointer_cancel_still_ends_drag(page):
+    """The active pointer's own cancel must still end the drag."""
+    _boot_resize(page, capture="throw")
+    _pointer(page, "pointerdown", x=100, pointer_id=1)
+    _pointer(page, "pointermove", target="#sidebar", x=150, pointer_id=1)
+    _pointer(page, "pointercancel", target="#sidebar", x=150, pointer_id=1)
+    state = page.evaluate(STATE_JS)
+    assert not state["dragging"] and not state["resizing"]
+    assert state["stored"] == "410"
+
+
+def test_two_tabs_collapse_choices_survive(page):
+    """Regression (Oct 2 re-gate): two tabs collapsing different groups.
+
+    Tab A (this page) toggles YESTERDAY locally; tab B writes its own choices
+    directly to storage. A re-render must adopt tab B's choices, and tab A's
+    next save must preserve them — while keys tab A toggled locally keep
+    their local value even when storage disagrees.
+    """
+    assert page.evaluate("() => window.__toggleGroup('YESTERDAY')") is True
+    assert page.evaluate("() => window.__toggleGroup('YESTERDAY')") is False
+
+    page.evaluate(
+        "() => localStorage.setItem('hermes-date-groups-collapsed',"
+        " JSON.stringify({YESTERDAY: true, TODAY: true}))"
+    )
+
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True, (
+        "a re-render must pick up another tab's collapse choice from storage"
+    )
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['YESTERDAY']") is False, (
+        "a locally toggled group must not be overwritten by storage on re-render"
+    )
+
+    page.evaluate("() => window.__toggleGroup('OLDER')")
+    stored = json.loads(page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')"))
+    assert stored == {"YESTERDAY": False, "TODAY": True, "OLDER": True}, (
+        "saving a local toggle must not clobber another tab's persisted choices"
+    )

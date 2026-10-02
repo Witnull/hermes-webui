@@ -2755,7 +2755,7 @@ if(window.visualViewport){
       if(fallbackDoc){
         document.removeEventListener('pointermove', onMove);
         document.removeEventListener('pointerup', onUp);
-        document.removeEventListener('pointercancel', endResize);
+        document.removeEventListener('pointercancel', onCancel);
         fallbackDoc=false;
       }
       handle.classList.remove('dragging');
@@ -2772,6 +2772,13 @@ if(window.visualViewport){
     };
     const onUp = ev=>{
       if(activePointer===null || (ev.pointerId!==undefined && ev.pointerId!==activePointer)) return;
+      endResize();
+    };
+    // Cancel/revoke events from OTHER pointers (a pen or touch contact
+    // elsewhere) must not end this drag; only the active pointer's own
+    // cancel does. Window blur still ends the drag unconditionally.
+    const onCancel = ev=>{
+      if(activePointer===null || ev.pointerId!==activePointer) return;
       endResize();
     };
 
@@ -2794,15 +2801,15 @@ if(window.visualViewport){
         fallbackDoc=true;
         document.addEventListener('pointermove', onMove);
         document.addEventListener('pointerup', onUp);
-        document.addEventListener('pointercancel', endResize);
+        document.addEventListener('pointercancel', onCancel);
       }
     });
     handle.addEventListener('pointermove', onMove);
     handle.addEventListener('pointerup', onUp);
-    handle.addEventListener('pointercancel', endResize);
+    handle.addEventListener('pointercancel', onCancel);
     // The platform can still revoke capture (tab switch, OS gesture); that
     // must end the drag instead of leaving the panel stuck to the cursor.
-    handle.addEventListener('lostpointercapture', endResize);
+    handle.addEventListener('lostpointercapture', onCancel);
     window.addEventListener('blur', endResize);
   }
 

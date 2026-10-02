@@ -8718,13 +8718,23 @@ function renderSessionListFromCache(){
   // Collapse state: in-memory authority, localStorage as best-effort
   // persistence. If the write fails (quota, blocked storage) the toggle must
   // still take effect for this session instead of silently reverting (#7953).
-  if(!window.__hermesDateGroupCollapsed){
-    let stored={};
-    try{stored=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}')||{};}catch(e){}
-    window.__hermesDateGroupCollapsed=stored;
-  }
+  if(!window.__hermesDateGroupCollapsed) window.__hermesDateGroupCollapsed={};
+  if(!window.__hermesDateGroupToggled) window.__hermesDateGroupToggled=new Set();
   const _groupCollapsed=window.__hermesDateGroupCollapsed;
+  const _locallyToggled=window.__hermesDateGroupToggled;
+  // Keys toggled in THIS tab are the in-memory authority; every other key
+  // follows the latest stored value, re-read on each render and again before
+  // each save, so another tab's choices stay visible and survive this tab's
+  // writes (#7953).
+  const _mergeStoredCollapsed=()=>{
+    try{
+      const fresh=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}')||{};
+      for(const k in fresh){ if(!_locallyToggled.has(k)) _groupCollapsed[k]=fresh[k]; }
+    }catch(e){}
+  };
+  _mergeStoredCollapsed();
   const _saveCollapsed=()=>{
+    _mergeStoredCollapsed();
     try{localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));}
     catch(e){ if(typeof console!=='undefined'&&console.warn) console.warn('hermes: date-group collapse state could not be persisted', e); }
   };
@@ -8820,6 +8830,7 @@ function renderSessionListFromCache(){
       const isCollapsed=body.style.display==='none';
       body.style.display=isCollapsed?'':'none';
       caret.classList.toggle('collapsed',!isCollapsed);
+      _locallyToggled.add(g.label);
       _groupCollapsed[g.label]=!isCollapsed;
       _saveCollapsed();
       renderSessionListFromCache();
