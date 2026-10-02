@@ -14294,9 +14294,20 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/share" or parsed.path.startswith("/share/"):
         share_path = (Path(__file__).parent.parent / "static" / "share.html").resolve()
+        # Same contract as the app shell: the share page renders with renderMd(),
+        # so it needs the validated CSP image allowlist, computed once and shared
+        # with this response's header (#7941).
+        from api.helpers import _csp_extra_img_src, csp_img_extra_sources
+
+        share_img_src = _csp_extra_img_src()
+        handler._csp_extra_img_src_preset = share_img_src
+        share_html = share_path.read_text(encoding="utf-8").replace(
+            "__CSP_IMG_EXTRA_JSON__",
+            json.dumps(csp_img_extra_sources(share_img_src)).replace("<", "\\u003c"),
+        )
         return t(
             handler,
-            share_path.read_text(encoding="utf-8"),
+            share_html,
             content_type="text/html; charset=utf-8",
             extra_headers={
                 "X-Robots-Tag": "noindex, nofollow",

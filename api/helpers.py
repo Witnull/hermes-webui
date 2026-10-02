@@ -372,7 +372,14 @@ def _security_headers(handler):
     # A route that already embedded the image allowlist in its body (the app
     # shell's window.__HERMES_CONFIG__.imgSrcExtra) pre-sets this attribute so
     # the header and the page agree for this response; otherwise read it here.
+    # Consume it: with keep-alive one handler instance serves several requests,
+    # and a later response on the same connection must read its own value.
     preset_img_src = getattr(handler, "_csp_extra_img_src_preset", None)
+    if preset_img_src is not None:
+        try:
+            delattr(handler, "_csp_extra_img_src_preset")
+        except AttributeError:
+            pass
     extra_img_src = preset_img_src if isinstance(preset_img_src, str) else _csp_extra_img_src()
     handler._csp_extra_connect_src = extra_connect_src
     handler._csp_extra_frame_src = extra_frame_src

@@ -202,3 +202,39 @@ def test_page_config_carries_the_same_validated_list():
     assert csp_img_extra_sources("") == []
     index = (REPO / "static" / "index.html").read_text(encoding="utf-8")
     assert "imgSrcExtra:__CSP_IMG_EXTRA_JSON__" in index
+
+
+def test_share_page_and_app_shell_carry_resolved_allowlist():
+    """Both renderMd() pages get the validated list (no raw placeholder leaks)."""
+    import urllib.request
+
+    from tests._pytest_port import BASE
+
+    for path in ("/share/example-token", "/"):
+        with urllib.request.urlopen(BASE + path, timeout=10) as r:
+            body = r.read().decode("utf-8")
+        assert "__CSP_IMG_EXTRA_JSON__" not in body, path
+        assert "imgSrcExtra:[]" in body, path  # test server runs without HERMES_WEBUI_CSP_IMG_EXTRA
+
+
+def test_share_html_template_sets_config_before_ui_js():
+    share = (REPO / "static" / "share.html").read_text(encoding="utf-8")
+    cfg_at = share.index("imgSrcExtra:__CSP_IMG_EXTRA_JSON__")
+    assert cfg_at < share.index('src="/static/ui.js"')
+
+
+def test_preset_is_consumed_so_keepalive_requests_read_their_own_value(monkeypatch):
+    from api.helpers import _security_headers
+
+    class _H:
+        def send_header(self, *_a):
+            pass
+
+    handler = _H()
+    handler._csp_extra_img_src_preset = " https://a.example"
+    monkeypatch.setenv("HERMES_WEBUI_CSP_IMG_EXTRA", "https://b.example")
+    _security_headers(handler)
+    assert handler._csp_extra_img_src == " https://a.example"
+    assert not hasattr(handler, "_csp_extra_img_src_preset")
+    _security_headers(handler)  # next response on the same connection
+    assert handler._csp_extra_img_src == " https://b.example"
