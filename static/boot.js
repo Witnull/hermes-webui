@@ -2746,11 +2746,18 @@ if(window.visualViewport){
       if(saved) targetEl.style.width = saved + 'px';
     }
 
-    let startX=0, startW=0, activePointer=null;
+    let startX=0, startW=0, activePointer=null, fallbackDoc=false;
     const endResize=()=>{
       if(activePointer===null) return;
-      try{ handle.releasePointerCapture(activePointer); }catch(_){}
+      const id=activePointer;
       activePointer=null;
+      try{ handle.releasePointerCapture(id); }catch(_){}
+      if(fallbackDoc){
+        document.removeEventListener('pointermove', onMove);
+        document.removeEventListener('pointerup', onUp);
+        document.removeEventListener('pointercancel', endResize);
+        fallbackDoc=false;
+      }
       handle.classList.remove('dragging');
       document.body.classList.remove('resizing');
       const w=parseInt(targetEl.style.width,10);
@@ -2778,7 +2785,17 @@ if(window.visualViewport){
       document.body.classList.add('resizing');
       // Pointer capture keeps move/up routed to the handle even when the
       // pointer leaves the window, so a release can never be lost (#7954).
-      try{ handle.setPointerCapture(ev.pointerId); }catch(_){}
+      let captured=false;
+      try{ handle.setPointerCapture(ev.pointerId); captured=true; }catch(_){ captured=false; }
+      if(!captured){
+        // Capture is unavailable or threw: without a document-level fallback
+        // the drag would stall the moment the pointer leaves this handle, and
+        // the drag state would stick (the #7954 regression this must avoid).
+        fallbackDoc=true;
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        document.addEventListener('pointercancel', endResize);
+      }
     });
     handle.addEventListener('pointermove', onMove);
     handle.addEventListener('pointerup', onUp);
