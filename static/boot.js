@@ -2746,30 +2746,47 @@ if(window.visualViewport){
       if(saved) targetEl.style.width = saved + 'px';
     }
 
-    let startX=0, startW=0;
+    let startX=0, startW=0, activePointer=null;
+    const endResize=()=>{
+      if(activePointer===null) return;
+      try{ handle.releasePointerCapture(activePointer); }catch(_){}
+      activePointer=null;
+      handle.classList.remove('dragging');
+      document.body.classList.remove('resizing');
+      const w=parseInt(targetEl.style.width,10);
+      if(Number.isFinite(w)){ try{ localStorage.setItem(storageKey, w); }catch(_){} }
+    };
+    const onMove = ev=>{
+      if(activePointer===null || ev.pointerId!==activePointer) return;
+      ev.preventDefault();
+      const delta = edge==='right' ? ev.clientX - startX : startX - ev.clientX;
+      const newW = Math.min(maxW, Math.max(minW, startW + delta));
+      targetEl.style.width = newW + 'px';
+    };
+    const onUp = ev=>{
+      if(activePointer===null || (ev.pointerId!==undefined && ev.pointerId!==activePointer)) return;
+      endResize();
+    };
 
-    handle.addEventListener('mousedown', e=>{
-      e.preventDefault();
-      startX = e.clientX;
+    handle.addEventListener('pointerdown', ev=>{
+      if(ev.pointerType==='touch') return;
+      ev.preventDefault();
+      activePointer=ev.pointerId;
+      startX = ev.clientX;
       startW = targetEl.getBoundingClientRect().width;
       handle.classList.add('dragging');
       document.body.classList.add('resizing');
-
-      const onMove = ev=>{
-        const delta = edge==='right' ? ev.clientX - startX : startX - ev.clientX;
-        const newW = Math.min(maxW, Math.max(minW, startW + delta));
-        targetEl.style.width = newW + 'px';
-      };
-      const onUp = ()=>{
-        handle.classList.remove('dragging');
-        document.body.classList.remove('resizing');
-        localStorage.setItem(storageKey, parseInt(targetEl.style.width));
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-      };
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
+      // Pointer capture keeps move/up routed to the handle even when the
+      // pointer leaves the window, so a release can never be lost (#7954).
+      try{ handle.setPointerCapture(ev.pointerId); }catch(_){}
     });
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', endResize);
+    // The platform can still revoke capture (tab switch, OS gesture); that
+    // must end the drag instead of leaving the panel stuck to the cursor.
+    handle.addEventListener('lostpointercapture', endResize);
+    window.addEventListener('blur', endResize);
   }
 
   // Run after DOM ready (called from boot)
