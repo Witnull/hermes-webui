@@ -3,7 +3,6 @@ Hermes Web UI -- SSE streaming engine and agent thread runner.
 Includes Sprint 10 cancel support via CANCEL_FLAGS.
 """
 import base64
-import collections
 import contextlib
 import contextvars
 import json
@@ -4341,34 +4340,31 @@ def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
     steps reuse it (agents derive IDs deterministically when providers omit them).
 
     IDs come from the step's ``tool_calls``, else its following tool results.
-    Every explicit ID occurrence in the turn is reserved first; ID-less results
-    then take the remaining live starts in order, but only when the counts match
-    one-to-one. Otherwise they stay unbound: misattribution is worse than loss.
+    ID-less results are bound by aligning every result slot of the turn with
+    the live starts in order; only when the counts match and each explicit ID
+    sits at its aligned start. Otherwise they stay unbound: misattribution is
+    worse than loss.
     """
-    step_ids, idless = {}, []
+    step_ids, slots = {}, []
     positions = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get('role') == 'assistant']
     for pos in positions[prev_asst:]:
         msg = messages[pos]
         ids = [tc.get('id') for tc in msg.get('tool_calls') or [] if isinstance(tc, dict) and tc.get('id')]
+        slots.extend((pos, i) for i in ids)
         if not ids:
             for m in messages[pos + 1:]:
                 if not (isinstance(m, dict) and m.get('role') == 'tool'):
                     break
+                slots.append((pos, m.get('tool_call_id') or None))
                 if m.get('tool_call_id'):
                     ids.append(m['tool_call_id'])
-                else:
-                    idless.append(pos)
         step_ids[pos] = ids
-    reserved = collections.Counter(i for ids in step_ids.values() for i in ids)
-    remaining = []
-    for call_id in started_ids:
-        if reserved[call_id]:
-            reserved[call_id] -= 1
-        else:
-            remaining.append(call_id)
-    if idless and len(idless) == len(remaining):
-        for pos, call_id in zip(idless, remaining, strict=True):
-            step_ids[pos].append(call_id)
+    started = list(started_ids)
+    if (any(i is None for _, i in slots) and len(slots) == len(started)
+            and all(i is None or i == s for (_, i), s in zip(slots, started, strict=True))):
+        for (pos, call_id), start_id in zip(slots, started, strict=True):
+            if call_id is None:
+                step_ids[pos].append(start_id)
     return step_ids
 
 

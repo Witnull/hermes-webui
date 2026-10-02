@@ -351,3 +351,30 @@ def test_call_id_repeated_across_steps_keeps_reasoning_in_step_order(cleanup_tes
          {'role': 'assistant', 'content': 'done', 'reasoning': None}],
     )
     assert _reasonings(saved) == ['think A', 'think B', None]
+
+
+def test_idless_results_before_reused_call_id_keep_start_order(cleanup_test_sessions):
+    # Starts dup, c2, dup; saved: two ID-less results, then an explicit dup.
+    # Slots align with starts in order, so the later dup must not claim the first.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'dup'), ('reasoning', 'think B'), ('tool', 'c2'),
+         ('reasoning', 'think C'), ('tool', 'dup'), ('token', 'done')],
+        [_bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _tool_step('dup', None), _tool_result('dup'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'think B', 'think C', None]
+
+
+def test_explicit_id_out_of_start_order_leaves_idless_steps_unbound(cleanup_test_sessions):
+    # Starts c1, c2 but the saved explicit c1 sits in the second slot: the
+    # in-order alignment is contradicted, so the ID-less step stays unbound.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('reasoning', 'think B'), ('tool', 'c2'),
+         ('token', 'done')],
+        [_bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _tool_step('c1', None), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == [None, 'think A', None]
