@@ -31,7 +31,7 @@ global.window = { __HERMES_CONFIG__: { imgSrcExtra: cfg.extra } };
 global.location = new URL(cfg.origin);
 global.document = { createElement: () => ({ innerHTML: '', textContent: '' }), baseURI: cfg.origin };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const t = k => ({remote_image_open: 'Open image', media_svg_label: 'Diagram'}[k] || k);
+const t = k => ({remote_image_open: 'Open image', remote_image_reason: 'Remote image not loaded automatically. Opens {host} in a new tab.', media_svg_label: 'Diagram'}[k] || k);
 function _mediaKindForName(n){ return /\.(mp3|wav|ogg)$/i.test(n)?'audio':(/\.(mp4|webm)$/i.test(n)?'video':''); }
 function _mediaPlayerHtml(kind, src){ return `<${kind} src="${esc(src)}"></${kind}>`; }
 function extractFunc(name){
@@ -45,7 +45,7 @@ function extractFunc(name){
  eval(src.slice(a,b).replace(/^const /gm,'var '));}
 const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
 const _SVG_EXTS=/\.svg$/i;
-for (const n of ['_dataImageHtml','_remoteImageSources','_remoteImageSourceMatches','_remoteImageAllowed',
+for (const n of ['_dataImageHtml','_remoteImageReason','_remoteImageSources','_remoteImageSourceMatches','_remoteImageAllowed',
                  '_remoteImagePlaceholderHtml','_mdImageHtml','_inlineMediaHtmlForRef','_mediaTokenParts',
                  '_matchBacktickFenceLine','_isBacktickFenceClose','renderMd']) eval(extractFunc(n));
 const out = {};
@@ -238,3 +238,18 @@ def test_preset_is_consumed_so_keepalive_requests_read_their_own_value(monkeypat
     assert not hasattr(handler, "_csp_extra_img_src_preset")
     _security_headers(handler)  # next response on the same connection
     assert handler._csp_extra_img_src == " https://b.example"
+
+
+def test_chip_explains_why_and_alt_only_in_title(driver):
+    out = _run(driver, md={
+        "md": f"![Throughput by release]({EXFIL})",
+        "forged": '<a class="msg-media-link" href="https://evil.example/x" title="Click to verify your account">x</a>',
+        "forged_prefix": '<a class="msg-media-link" href="https://attacker.example/beacon.png" '
+                         'title="Remote image not loaded automatically. Opens attacker.example in a new tab. Also click here">x</a>',
+    })
+    html = out["md:md"]
+    assert 'title="Remote image not loaded automatically. Opens attacker.example in a new tab. (Throughput by release)"' in html
+    assert 'aria-label="Remote image not loaded automatically.' in html
+    assert ">\U0001f5bc Open image \u00b7 attacker.example</a>" in html  # visible label never carries alt text
+    assert "title=" not in out["md:forged"]
+    assert "title=" not in out["md:forged_prefix"]

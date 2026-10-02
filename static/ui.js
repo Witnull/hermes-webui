@@ -2891,11 +2891,24 @@ function _remoteImageAllowed(raw){
   return _remoteImageSources().some(source=>_remoteImageSourceMatches(source,url));
 }
 
-function _remoteImagePlaceholderHtml(raw){
+function _remoteImageReason(raw){
+  let host='';
+  try{host=new URL(String(raw||'')).host;}catch(_){host='';}
+  const reason=(typeof t==='function'?t('remote_image_reason'):'')||'Remote image not loaded automatically. Opens {host} in a new tab.';
+  return reason.replace('{host}', host||'the link');
+}
+
+function _remoteImagePlaceholderHtml(raw, altText){
   let host='';
   try{host=new URL(String(raw||'')).host;}catch(_){host='';}
   const label=(typeof t==='function'?t('remote_image_open'):'')||'Open image';
-  return `<a class="msg-media-link" href="${esc(String(raw||''))}" target="_blank" rel="noopener">🖼 ${esc(label)}${host?` · ${esc(host)}`:''}</a>`;
+  // Say WHY the picture is not shown (title/aria-label), like the PDF/HTML
+  // preview fallbacks and mail clients do. Alt text is model-controlled, so it
+  // only ever goes in the title after the reason, never in the visible label.
+  const reason=_remoteImageReason(raw);
+  const alt=String(altText||'').trim();
+  const tip=alt&&alt!=='image'?`${reason} (${alt.slice(0,120)})`:reason;
+  return `<a class="msg-media-link" href="${esc(String(raw||''))}" target="_blank" rel="noopener" title="${esc(tip)}" aria-label="${esc(tip)}">🖼 ${esc(label)}${host?` · ${esc(host)}`:''}</a>`;
 }
 
 // Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
@@ -2910,7 +2923,7 @@ function _mdImageHtml(alt, url){
     return esc(`![${alt}](${String(url).slice(0,64)}…)`);
   }
   if(/^file:\/\//i.test(url)) return _inlineMediaHtmlForRef(url,undefined,alt);
-  if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(url)) return _remoteImagePlaceholderHtml(url);
+  if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(url)) return _remoteImagePlaceholderHtml(url, alt);
   return `<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`;
 }
 
@@ -8564,11 +8577,27 @@ function renderMd(raw){
       const rel=a.rel==='noopener'?' rel="noopener"':'';
       const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link']);
       const download=a.download?` download="${esc(a.download)}"`:'';
-      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}>`;
+      // #7941: keep the blocked-remote-image tooltip only on a media chip whose
+      // href really is a non-allowlisted remote image AND whose title begins with
+      // the reason computed from that same href, so model-authored anchors cannot
+      // carry arbitrary tooltips.
+      let tipAttr='';
+      if(a.title&&cls.includes('msg-media-link')&&typeof _remoteImageAllowed==='function'
+         &&typeof _remoteImageReason==='function'){
+        const href=_safeAttrValue(a.href);
+        const tip=_safeAttrValue(a.title).slice(0,260);
+        const reason=/^https?:\/\//i.test(href)&&!_remoteImageAllowed(href)?_remoteImageReason(href):'';
+        // Exactly the shapes _remoteImagePlaceholderHtml emits: the reason, or the
+        // reason followed by " (<alt>)".
+        if(reason&&(tip===reason||(tip.startsWith(reason+' (')&&tip.endsWith(')')))){
+          tipAttr=` title="${esc(tip)}" aria-label="${esc(tip)}"`;
+        }
+      }
+      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}${tipAttr}>`;
     }
     if(name==='img'){
       if(!_isSafeUrl(a.src,true)) return '';
-      if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(_safeAttrValue(a.src))) return _remoteImagePlaceholderHtml(_safeAttrValue(a.src));
+      if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(_safeAttrValue(a.src))) return _remoteImagePlaceholderHtml(_safeAttrValue(a.src), _safeAttrValue(a.alt||''));
       const cls=_cls(a.class,['msg-media-img']);
       const alt=` alt="${esc(_safeAttrValue(a.alt||''))}"`;
       const loading=a.loading==='lazy'?' loading="lazy"':'';
