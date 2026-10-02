@@ -12233,6 +12233,34 @@ function _worklogDetailScrollableBody(el){
   if(!el||!el.querySelector) return null;
   return el.querySelector('.thinking-card-body,.tool-card-detail');
 }
+// Live thinking tail-follow: reasoning text that streams into an expanded
+// thinking card should keep scrolling into view the way the message pane
+// follows its bottom, while a reader who scrolls up inside the card is held
+// in place. The latch below records per-body follow intent: it starts true on
+// a fresh streaming body (so a card begins following from its first overflow),
+// the passive scroll listener flips it as the reader moves (hold away from the
+// tail, resume at the tail), and the detail capture/restore path carries it
+// across DOM rebuilds via the atBottom snapshot field.
+const _THINKING_TAIL_STICK_PX=24;
+function _bindThinkingTailFollow(body){
+  if(!body||typeof body.addEventListener!=='function') return;
+  if(body._thinkingTailFollow===undefined) body._thinkingTailFollow=true;
+  if(body._thinkingTailFollowBound) return;
+  body._thinkingTailFollowBound=true;
+  body.addEventListener('scroll',()=>{
+    const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+    body._thinkingTailFollow=room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+  },{passive:true});
+}
+function _worklogDetailBodyAtTail(body){
+  if(!body) return true;
+  if(body._thinkingTailFollow===true) return true;
+  if(body._thinkingTailFollow===false) return false;
+  // Unbound body (e.g. a settled card that never streamed): fall back to the
+  // literal scroll position.
+  const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+  return room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+}
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
   // #5966 (Codex F2 r2): restoring an OPEN state on a settled Transparent Stream
@@ -12276,6 +12304,7 @@ function _captureWorklogDetailDisclosureState(root){
     state.set(key,{
       open:_worklogDetailDisclosureIsOpen(el),
       scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
+      atBottom:_worklogDetailBodyAtTail(body),
     });
   });
   return state;
@@ -12292,9 +12321,21 @@ function _restoreWorklogDetailDisclosureState(root, state){
     const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
     _setWorklogDetailDisclosureOpen(el, open);
     const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
-    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
+    const atBottom=(saved&&typeof saved==='object')?saved.atBottom===true:false;
+    if(open){
       const body=_worklogDetailScrollableBody(el);
-      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+      if(body){
+        // A rebuilt body starts a fresh follow latch; carry the captured
+        // follow/hold intent across the rebuild and re-pin tail readers to the
+        // NEW bottom (content may have grown while the DOM was rebuilt).
+        // Readers who had scrolled up get their absolute offset replayed.
+        if(saved&&typeof saved==='object'&&'atBottom' in saved) body._thinkingTailFollow=atBottom;
+        if(atBottom){
+          body.scrollTop=Math.max(0, body.scrollHeight-body.clientHeight);
+        }else if(Number.isFinite(scrollTop)&&scrollTop>0){
+          body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+        }
+      }
     }
   });
 }
@@ -14548,8 +14589,14 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   const existingPre = existing.querySelector('.thinking-card-body pre');
   const nodePre = node.querySelector('.thinking-card-body pre');
   if(!existingPre || !nodePre) return false;
+  const thinkingBody = existingPre.closest ? existingPre.closest('.thinking-card-body') : null;
+  if(thinkingBody&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(thinkingBody);
+  const thinkingFollow = thinkingBody&&thinkingBody._thinkingTailFollow!==false;
   const nextText = String(nodePre.textContent || '');
-  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  if(existingPre.textContent !== nextText){
+    existingPre.textContent = nextText;
+    if(thinkingFollow) thinkingBody.scrollTop=Math.max(0,(Number(thinkingBody.scrollHeight)||0)-(Number(thinkingBody.clientHeight)||0));
+  }
   const nodePreview = node.querySelector('.transparent-event-thinking-preview');
   const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
   if(typeof _decorateTransparentEventRow === 'function'){
@@ -21217,7 +21264,14 @@ function _renderThinkingInto(row,text=''){
   }
   const pre=row.querySelector('.thinking-card-body pre');
   if(pre){
+    const body=pre.closest?pre.closest('.thinking-card-body'):null;
+    if(body&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body);
+    const follow=body&&body._thinkingTailFollow!==false;
+    const changed=pre.textContent!==clean;
     pre.textContent=clean;
+    // Only a real text update pins the tail: a creation write (same text)
+    // leaves a settled card at the top for its reader.
+    if(follow&&changed) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
     return;
   }
   row.innerHTML=_thinkingMarkup(text);
