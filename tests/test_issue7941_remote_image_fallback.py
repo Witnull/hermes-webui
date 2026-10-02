@@ -249,7 +249,14 @@ def test_chip_explains_why_and_alt_only_in_title(driver):
     })
     html = out["md:md"]
     assert 'title="Remote image not loaded automatically. Opens attacker.example in a new tab. (Throughput by release)"' in html
-    assert 'aria-label="Remote image not loaded automatically.' in html
+    assert 'aria-label=' not in html  # accessible name stays the visible label (WCAG 2.5.3)
     assert ">\U0001f5bc Open image \u00b7 attacker.example</a>" in html  # visible label never carries alt text
     assert "title=" not in out["md:forged"]
     assert "title=" not in out["md:forged_prefix"]
+
+
+def test_long_host_and_alt_keep_the_tooltip(driver):
+    host = "images." + "very-long-subdomain-name." * 3 + "example.net"
+    url = f"https://{host}/c.png"
+    out = _run(driver, md={"md": f"![{'A' * 120}]({url})"})
+    assert 'title="Remote image not loaded automatically. Opens ' + host in out["md:md"]

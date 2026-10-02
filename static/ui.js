@@ -2902,13 +2902,14 @@ function _remoteImagePlaceholderHtml(raw, altText){
   let host='';
   try{host=new URL(String(raw||'')).host;}catch(_){host='';}
   const label=(typeof t==='function'?t('remote_image_open'):'')||'Open image';
-  // Say WHY the picture is not shown (title/aria-label), like the PDF/HTML
+  // Say WHY the picture is not shown (title only: aria-label would replace the
+  // visible 'Open image' accessible name, WCAG 2.5.3), like the PDF/HTML
   // preview fallbacks and mail clients do. Alt text is model-controlled, so it
   // only ever goes in the title after the reason, never in the visible label.
   const reason=_remoteImageReason(raw);
   const alt=String(altText||'').trim();
   const tip=alt&&alt!=='image'?`${reason} (${alt.slice(0,120)})`:reason;
-  return `<a class="msg-media-link" href="${esc(String(raw||''))}" target="_blank" rel="noopener" title="${esc(tip)}" aria-label="${esc(tip)}">🖼 ${esc(label)}${host?` · ${esc(host)}`:''}</a>`;
+  return `<a class="msg-media-link" href="${esc(String(raw||''))}" target="_blank" rel="noopener" title="${esc(tip)}">🖼 ${esc(label)}${host?` · ${esc(host)}`:''}</a>`;
 }
 
 // Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
@@ -8585,12 +8586,12 @@ function renderMd(raw){
       if(a.title&&cls.includes('msg-media-link')&&typeof _remoteImageAllowed==='function'
          &&typeof _remoteImageReason==='function'){
         const href=_safeAttrValue(a.href);
-        const tip=_safeAttrValue(a.title).slice(0,260);
+        const tip=_safeAttrValue(a.title);
         const reason=/^https?:\/\//i.test(href)&&!_remoteImageAllowed(href)?_remoteImageReason(href):'';
         // Exactly the shapes _remoteImagePlaceholderHtml emits: the reason, or the
         // reason followed by " (<alt>)".
         if(reason&&(tip===reason||(tip.startsWith(reason+' (')&&tip.endsWith(')')))){
-          tipAttr=` title="${esc(tip)}" aria-label="${esc(tip)}"`;
+          tipAttr=` title="${esc(tip)}"`;
         }
       }
       return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}${tipAttr}>`;
