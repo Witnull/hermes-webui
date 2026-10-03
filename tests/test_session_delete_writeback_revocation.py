@@ -384,7 +384,7 @@ def test_delete_between_sidecar_commit_and_index_update(local_store, monkeypatch
     original = models._write_session_index
 
     def paused_index(updates=None, **kwargs):
-        if updates and any(row is session for row in updates):
+        if updates and any(row is session or getattr(row, "session_id", None) == session.session_id for row in updates):
             entered.set()
             assert release.wait(5)
         return original(updates, **kwargs)

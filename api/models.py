@@ -1973,11 +1973,10 @@ class Session:
                     pass
                 raise
         if not skip_index:
-            with _INDEX_WRITE_LOCK:
-                persisted_index_session = copy.copy(self)
-                persisted_index_session.messages = guarded_messages
-                persisted_index_session._metadata_message_count = len(guarded_messages)
-                _write_session_index(updates=[persisted_index_session])
+            persisted_index_session = copy.copy(self)
+            persisted_index_session.messages = guarded_messages
+            persisted_index_session._metadata_message_count = len(guarded_messages)
+            _write_session_index(updates=[persisted_index_session])
 
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
