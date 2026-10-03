@@ -84,13 +84,35 @@ __COLLAPSE_STATE__
 // best-effort, then re-render from the in-memory authority.
 window.__toggleGroup = (label) => {
   const state = window.__hermesDateGroupCollapsed;
-  _locallyToggled.add(label);
+  _pending.add(label);
   state[label] = !state[label];
   _saveCollapsed();
   return state[label];
 };
 window.__reseedCollapseState = () => {
   __COLLAPSE_STATE__
+};
+// Mirrors the render's visibility rule (static/sessions.js): a group body is
+// hidden exactly when its collapse flag is truthy. Builds rowsPerGroup rows
+// per group so visible session-row counts can be asserted.
+window.__renderGroups = (labels, rowsPerGroup) => {
+  const host = document.getElementById('sidebar');
+  host.innerHTML = '';
+  let visible = 0;
+  for (const label of labels) {
+    const body = document.createElement('div');
+    body.className = 'session-date-body';
+    for (let i = 0; i < rowsPerGroup; i++) {
+      const row = document.createElement('div');
+      row.className = 'session-row';
+      body.appendChild(row);
+    }
+    const collapsed = Boolean(window.__hermesDateGroupCollapsed[label]);
+    if (collapsed) body.style.display = 'none';
+    host.appendChild(body);
+    if (!collapsed) visible += rowsPerGroup;
+  }
+  return visible;
 };
 </script>
 </body></html>
@@ -321,32 +343,86 @@ def test_active_pointer_cancel_still_ends_drag(page):
     assert state["stored"] == "410"
 
 
-def test_two_tabs_collapse_choices_survive(page):
-    """Regression (Oct 2 re-gate): two tabs collapsing different groups.
+def test_successful_cross_tab_change_wins_over_released_local(page):
+    """Oct 3 re-gate: a local override is released once its snapshot is
+    successfully written, so another tab's newer successful choice wins.
 
-    Tab A (this page) toggles YESTERDAY locally; tab B writes its own choices
-    directly to storage. A re-render must adopt tab B's choices, and tab A's
-    next save must preserve them — while keys tab A toggled locally keep
-    their local value even when storage disagrees.
+    A collapses YESTERDAY (write succeeds, override released). B reopens it
+    (write succeeds). A re-renders and must show YESTERDAY expanded with its
+    rows visible. A then toggles the unrelated OLDER group; the saved JSON
+    must preserve B's newer YESTERDAY:false.
     """
+    # A collapses YESTERDAY; the write succeeds and releases the override.
     assert page.evaluate("() => window.__toggleGroup('YESTERDAY')") is True
-    assert page.evaluate("() => window.__toggleGroup('YESTERDAY')") is False
-
-    page.evaluate(
-        "() => localStorage.setItem('hermes-date-groups-collapsed',"
-        " JSON.stringify({YESTERDAY: true, TODAY: true}))"
+    assert json.loads(page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')")) == {"YESTERDAY": True}
+    assert page.evaluate("() => window.__hermesDateGroupPending.size") == 0, (
+        "a successful write must release the pending override"
+    )
+    assert page.evaluate("() => window.__renderGroups(['YESTERDAY'], 6)") == 0, (
+        "a collapsed group must hide its session rows"
     )
 
+    # B reopens YESTERDAY (a successful write to shared storage).
+    page.evaluate("() => localStorage.setItem('hermes-date-groups-collapsed', JSON.stringify({YESTERDAY: false}))")
+
+    # A re-renders: the released key adopts B's newer choice.
     page.evaluate("() => window.__reseedCollapseState()")
-    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True, (
-        "a re-render must pick up another tab's collapse choice from storage"
-    )
     assert page.evaluate("() => window.__hermesDateGroupCollapsed['YESTERDAY']") is False, (
-        "a locally toggled group must not be overwritten by storage on re-render"
+        "after a successful write released the key, a newer stored choice must win"
+    )
+    assert page.evaluate("() => window.__renderGroups(['YESTERDAY'], 6)") == 6, (
+        "the adopted reopen must make the group's session rows visible again"
     )
 
+    # A toggles the unrelated OLDER group; B's YESTERDAY:false is preserved.
     page.evaluate("() => window.__toggleGroup('OLDER')")
     stored = json.loads(page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')"))
-    assert stored == {"YESTERDAY": False, "TODAY": True, "OLDER": True}, (
-        "saving a local toggle must not clobber another tab's persisted choices"
+    assert stored == {"YESTERDAY": False, "OLDER": True}, (
+        "an unrelated local toggle must not overwrite another tab's newer successful choice"
+    )
+
+
+def test_cleared_storage_expands_adopted_non_pending_group(page):
+    """Oct 3 re-gate: a valid empty/cleared snapshot removes adopted
+    (non-pending) keys, so a group another tab expanded is no longer hidden.
+    """
+    page.evaluate("() => localStorage.setItem('hermes-date-groups-collapsed', JSON.stringify({TODAY: true}))")
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True
+    assert page.evaluate("() => window.__renderGroups(['TODAY'], 4)") == 0
+
+    # Another tab clears storage entirely (a valid empty snapshot).
+    page.evaluate("() => localStorage.removeItem('hermes-date-groups-collapsed')")
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") in (None, False), (
+        "a valid cleared snapshot must remove an adopted (non-pending) collapse key"
+    )
+    assert page.evaluate("() => window.__renderGroups(['TODAY'], 4)") == 4, (
+        "the cleared key must make the group's session rows visible again"
+    )
+
+
+def test_malformed_or_unavailable_storage_preserves_state(page):
+    """Oct 3 re-gate controls: a malformed or unavailable read must not
+    clobber the current in-memory state or drop adopted collapses.
+    """
+    page.evaluate("() => localStorage.setItem('hermes-date-groups-collapsed', JSON.stringify({TODAY: true}))")
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True
+
+    # Malformed JSON: state preserved.
+    page.evaluate("() => localStorage.setItem('hermes-date-groups-collapsed', '{not-valid-json')")
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True, (
+        "a malformed read must preserve the current state"
+    )
+
+    # Unavailable storage: state preserved.
+    page.evaluate(
+        "() => { Object.defineProperty(Storage.prototype, 'getItem',"
+        " {value: function(){ throw new Error('denied'); }, configurable: true}); }"
+    )
+    page.evaluate("() => window.__reseedCollapseState()")
+    assert page.evaluate("() => window.__hermesDateGroupCollapsed['TODAY']") is True, (
+        "an unavailable read must preserve the current state"
     )
