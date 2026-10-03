@@ -77,12 +77,29 @@ if (Test-Path $envFile) {
     }
 }
 
-# === Find Python (matches start.sh order) ==============================
+# === Find Python (matches start.sh order + Hermes PM) =================
 $Python = $env:HERMES_WEBUI_PYTHON
 if (-not $Python) {
-    foreach ($candidate in @('python3', 'python', 'py')) {
-        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($cmd) { $Python = $cmd.Source; break }
+    # Prefer Hermes PM runtime Python (installed by setup-hermes.ps1 / activate.ps1)
+    $homeRoot = if ($env:HERMES_HOME) { $env:HERMES_HOME } elseif ($env:LOCALAPPDATA) { "$env:LOCALAPPDATA\hermes" } else { "$env:USERPROFILE\.hermes" }
+    $toolsDir = Join-Path $homeRoot 'tools'
+    if (Test-Path $toolsDir) {
+        $pmPy = Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+        if ($pmPy) { $Python = $pmPy }
+    }
+}
+if (-not $Python) {
+    $repoVenvPython = Join-Path $RepoRoot 'venv\Scripts\python.exe'
+    if (Test-Path $repoVenvPython) {
+        $Python = $repoVenvPython
+    } else {
+        foreach ($candidate in @('python3', 'python', 'py')) {
+            $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
+            if ($cmd) { $Python = $cmd.Source; break }
+        }
     }
 }
 if (-not $Python) {
@@ -108,11 +125,12 @@ if (-not $AgentDir) {
     # stays robust across Windows variants. USERPROFILE is always set so it
     # stays unguarded; the dev-checkout sibling is path-derived, not env-based.
     $candidates = @()
+    $sibling = Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent'
+    if (Test-Path $sibling) { $candidates += $sibling }
     $candidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
     foreach ($root in @($env:LOCALAPPDATA, ${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
         if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
     }
-    $candidates += (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent')
     # De-dup: when running in a WOW64 (32-bit-on-64-bit) PowerShell process,
     # $env:ProgramFiles is redirected to C:\Program Files (x86), so without
     # $env:ProgramW6432 (the canonical 64-bit override) we'd miss the real
@@ -159,6 +177,8 @@ $PortFinal = if ($Port) {
 }
 $env:HERMES_WEBUI_HOST = $BindHostFinal
 $env:HERMES_WEBUI_PORT = "$PortFinal"
+$env:HERMES_WEBUI_AGENT_DIR = $AgentDir
+$env:HERMES_WEBUI_PYTHON = $Python
 if (-not $env:HERMES_HOME) {
     if ($env:LOCALAPPDATA) {
         $env:HERMES_HOME = Join-Path $env:LOCALAPPDATA 'hermes'
