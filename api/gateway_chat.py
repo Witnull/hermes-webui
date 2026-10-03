@@ -1480,7 +1480,10 @@ def _run_gateway_chat_streaming(
             model_provider=model_provider,
             session_effort=getattr(s, "reasoning_effort", None),
         )
-        base_url, api_key = reattach_endpoint or _gateway_endpoint_for_profile(s.profile)
+        # The session's own profile, not the process-active one: this worker thread has no
+        # thread-local profile, so get_config()/os.environ describe whichever profile the
+        # process loaded. Same resolver the restart-reattach path already uses.
+        base_url, api_key = reattach_endpoint or _gateway_endpoint_for_profile(getattr(s, "profile", None))
         with _STREAM_RUN_STARTING_CONDITION:
             _STREAM_ENDPOINTS[stream_id] = (base_url, api_key)
         try:
