@@ -5,6 +5,11 @@ The thinking card body must keep scrolling as reasoning text streams in
 bottom, and keep that follow/hold intent across the Worklog detail rebuilds
 (capture/restore atBottom) that run while a stream is live.
 
+Tail-follow is explicit to LIVE thinking rows: a settled creation write must
+never seed the follow latch (an unchanged settled card at the top stays at the
+top across a rebuild), and tool-card details keep master's absolute-offset
+restore (no atBottom snapshot, no new-bottom re-pin).
+
 Runs the real functions from static/ui.js in node against a small DOM fake,
 mirroring the harness shape of test_issue5720_reasoning_owner.py.
 """
@@ -180,7 +185,7 @@ if(!sel) throw new Error('_worklogDetailDisclosureSelector not found in ui.js');
 globalThis._worklogDetailDisclosureSelector=sel[1];
 
 for(const name of [
-  '_bindThinkingTailFollow','_worklogDetailBodyAtTail',
+  '_bindThinkingTailFollow','_worklogDetailBodyAtTail','_thinkingRowIsLive',
   '_worklogDetailTextKey','_worklogDetailBaseKey',
   '_worklogDetailDisclosureIsOpen','_worklogDetailScrollableBody',
   '_setWorklogDetailDisclosureOpen','_worklogDetailDisclosureKeyForElement',
@@ -189,10 +194,11 @@ for(const name of [
 ]) eval(extractFunc(uiSrc,name));
 
 // ── Builders ────────────────────────────────────────────────────────────────
-function makeThinkingRow(text){
+function makeThinkingRow(text, live=true){
   const row=new FakeElement('div');
   row.className='agent-activity-thinking';
   row.setAttribute('data-thinking-key','k1');
+  if(live) row.setAttribute('data-live-thinking-row','1');
   const card=new FakeElement('div');
   card.className='thinking-card open';
   const body=new FakeElement('div');
@@ -210,10 +216,26 @@ function makeTransparentPair(existingText, nextText){
   const existing=makeThinkingRow(existingText);
   existing.row.className='transparent-event-row transparent-thinking-event';
   existing.row.setAttribute('data-event-type','thinking');
+  existing.row.setAttribute('data-live-thinking','1');
   const node=makeThinkingRow(nextText);
   node.row.className='transparent-event-row transparent-thinking-event';
   node.row.setAttribute('data-event-type','thinking');
+  node.row.setAttribute('data-live-thinking','1');
   return {existing:existing.row, existingBody:existing.body, node:node.row};
+}
+
+function makeToolRow(){
+  const row=new FakeElement('div');
+  row.className='tool-card-row';
+  row.setAttribute('data-tool-call-id','t1');
+  const card=new FakeElement('div');
+  card.className='tool-card open';
+  const body=new FakeElement('div');
+  body.className='tool-card-detail';
+  body.clientHeight=200;
+  card.appendChild(body);
+  row.appendChild(card);
+  return {row,card,body};
 }
 
 const out={};
@@ -249,12 +271,23 @@ const out={};
   out.s3_scroll=body.scrollTop;
 }
 
-// ── S4: a creation write (same text) does not pin a settled card ────────────
+// ── S4: a settled creation write is not tail-follow state (review #7988) ────
 {
-  const {row,body}=makeThinkingRow('fixed text');
+  const {row,body}=makeThinkingRow('fixed text', false);
   body.scrollHeight=900;
   _renderThinkingInto(row,'fixed text');
   out.s4_scroll=body.scrollTop;
+  out.s4_latch_seeded=body._thinkingTailFollow!==undefined;
+  // Capture + rebuild with growth: the settled top-of-card reader must not be
+  // jumped to the new bottom.
+  const state=_captureWorklogDetailDisclosureState(row);
+  const entry=state.get('thinking::k1#0');
+  out.s4_snap_has_atbottom=!!(entry&&('atBottom' in entry));
+  const rebuilt=makeThinkingRow('fixed text', false);
+  rebuilt.body.scrollHeight=1400;
+  _restoreWorklogDetailDisclosureState(rebuilt.row,state);
+  out.s4_rebuild_scroll=rebuilt.body.scrollTop;
+  out.s4_rebuild_latch=rebuilt.body._thinkingTailFollow!==undefined;
 }
 
 // ── S5: transparent-stream refresh follows / holds like the worklog path ────
@@ -311,20 +344,60 @@ const out={};
   rebuilt.body.scrollHeight=1300;
   _renderThinkingInto(rebuilt.row,'thinking grew again');
   out.s7_after_write_scroll=rebuilt.body.scrollTop;
+  // A SECOND rebuild cycle must still hold: the rebuilt body's creation write
+  // seeds follow=true, and restore must override it with the captured hold or
+  // the reader is yanked to the bottom one tick after scrolling up.
+  const state2=_captureWorklogDetailDisclosureState(rebuilt.row);
+  const entry2=state2.get('thinking::k1#0');
+  out.s7_second_capture_atBottom=entry2?entry2.atBottom:null;
+  const rebuilt2=makeThinkingRow('thinking');
+  rebuilt2.body.scrollHeight=1400;
+  _restoreWorklogDetailDisclosureState(rebuilt2.row,state2);
+  out.s7_second_restored_scroll=rebuilt2.body.scrollTop;
+  out.s7_second_held=rebuilt2.body._thinkingTailFollow===false;
+  rebuilt2.body.scrollHeight=1500;
+  _renderThinkingInto(rebuilt2.row,'thinking grew yet again');
+  out.s7_second_after_write_scroll=rebuilt2.body.scrollTop;
 }
 
-// ── S8: unbound settled body at the top is not pinned on restore ────────────
+// ── S8: unbound settled body carries no tail-follow state across restore ────
 {
-  const {row,body}=makeThinkingRow('settled thinking');
+  const {row,body}=makeThinkingRow('settled thinking', false);
   body.scrollHeight=800;
   const state=_captureWorklogDetailDisclosureState(row);
   const entry=state.get('thinking::k1#0');
-  out.s8_capture_atBottom=entry?entry.atBottom:null;
-  const rebuilt=makeThinkingRow('settled thinking');
+  out.s8_capture_has_atbottom=!!(entry&&('atBottom' in entry));
+  const rebuilt=makeThinkingRow('settled thinking', false);
   rebuilt.body.scrollHeight=1200;
   _restoreWorklogDetailDisclosureState(rebuilt.row,state);
   out.s8_restored_scroll=rebuilt.body.scrollTop;
-  out.s8_held=rebuilt.body._thinkingTailFollow===false;
+  out.s8_latch=rebuilt.body._thinkingTailFollow===undefined?'none':String(rebuilt.body._thinkingTailFollow);
+}
+
+// ── S9: an open tool-card detail keeps its absolute offset across rebuilds ──
+{
+  const a=makeToolRow();
+  a.body.scrollHeight=800;
+  a.body.scrollTop=300;
+  const state=_captureWorklogDetailDisclosureState(a.row);
+  const entry=Array.from(state.values())[0];
+  out.s9_capture_has_atbottom=!!(entry&&('atBottom' in entry));
+  out.s9_capture_scrollTop=entry?entry.scrollTop:null;
+  const b=makeToolRow();
+  b.body.scrollHeight=1200;
+  _restoreWorklogDetailDisclosureState(b.row,state);
+  out.s9_restored_scroll=b.body.scrollTop;
+  out.s9_latch=b.body._thinkingTailFollow===undefined?'none':String(b.body._thinkingTailFollow);
+  // Even at its tail a tool detail replays its absolute offset (master
+  // behavior) — it must never be re-pinned to a rebuilt body's new bottom.
+  const c=makeToolRow();
+  c.body.scrollHeight=800;
+  c.body.scrollTop=600;
+  const state2=_captureWorklogDetailDisclosureState(c.row);
+  const d=makeToolRow();
+  d.body.scrollHeight=1200;
+  _restoreWorklogDetailDisclosureState(d.row,state2);
+  out.s9_tail_replayed_scroll=d.body.scrollTop;
 }
 
 console.log(JSON.stringify(out));
@@ -374,7 +447,14 @@ def test_reader_who_scrolled_up_is_held_until_back_at_the_tail():
 def test_creation_write_does_not_pin_a_settled_card():
     out = _run_scenarios()
 
+    # An unchanged settled write never seeds tail-follow state...
     assert out["s4_scroll"] == 0
+    assert out["s4_latch_seeded"] is False
+    # ...so the capture carries no atBottom and a taller rebuild leaves the
+    # top-of-card reader at the top instead of jumping them to the new bottom.
+    assert out["s4_snap_has_atbottom"] is False
+    assert out["s4_rebuild_scroll"] == 0
+    assert out["s4_rebuild_latch"] is False
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -404,12 +484,32 @@ def test_holding_reader_keeps_place_and_hold_across_a_rebuild():
     assert out["s7_restored_scroll"] == 300
     assert out["s7_held"] is True
     assert out["s7_after_write_scroll"] == 300
+    # Second rebuild cycle: the hold must survive repeated rebuilds, not just
+    # the first one (restore overrides the rebuilt body's seeded latch).
+    assert out["s7_second_capture_atBottom"] is False
+    assert out["s7_second_restored_scroll"] == 300
+    assert out["s7_second_held"] is True
+    assert out["s7_second_after_write_scroll"] == 300
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_unbound_settled_body_is_not_pinned_by_restore():
     out = _run_scenarios()
 
-    assert out["s8_capture_atBottom"] is False
+    assert out["s8_capture_has_atbottom"] is False
     assert out["s8_restored_scroll"] == 0
-    assert out["s8_held"] is True
+    assert out["s8_latch"] == "none"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_tool_detail_keeps_absolute_offset_across_rebuilds():
+    out = _run_scenarios()
+
+    # Tool-card details are not tail-follow bodies: no atBottom in the
+    # snapshot, no follow latch, and the prior absolute offset is preserved
+    # even when the detail was at its tail and the rebuild grew the content.
+    assert out["s9_capture_has_atbottom"] is False
+    assert out["s9_capture_scrollTop"] == 300
+    assert out["s9_restored_scroll"] == 300
+    assert out["s9_latch"] == "none"
+    assert out["s9_tail_replayed_scroll"] == 600
