@@ -2803,11 +2803,18 @@ def _looks_like_model_tag(candidate: str) -> bool:
     return False
 
 
-# Route hint for a ``custom`` session under a configured provider that aliases
-# to ``custom`` (``ollama``, legacy ``local``). Internal to
-# model_with_provider_context() -> resolve_model_provider(); it is not a
-# provider id and is never persisted or shown.
-_CONFIGURED_CUSTOM_LANE_PREFIX = "@custom-configured:"
+class _ConfiguredCustomLaneModel(str):
+    """A model id bound to the Custom lane of the configured endpoint (#7955).
+
+    model_with_provider_context() returns it for a ``custom`` session under a
+    configured provider that aliases to ``custom`` (``ollama``, legacy
+    ``local``), and resolve_model_provider() routes it to ``model.base_url``.
+    The lane travels as this type, not as text: every caller passes the value
+    straight from one to the other, and no ``@<provider>:<model>`` string a
+    ``providers.<name>`` entry can produce is an instance of it.
+    """
+
+    __slots__ = ()
 
 
 def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
@@ -3033,6 +3040,8 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
             )
         return model, provider, base_url
 
+    # Read before the strip below, which returns a plain str.
+    configured_custom_lane = isinstance(model_id, _ConfiguredCustomLaneModel)
     model_id = (model_id or "").strip()
     if not model_id:
         return _finalize(model_id, config_provider, config_base_url)
@@ -3042,10 +3051,8 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     # ``providers.<name>`` or ``custom_providers[]`` record that carries the
     # configured provider's name, or lists the same model id, has its own
     # endpoint and credential and is not this lane.
-    if model_id.startswith(_CONFIGURED_CUSTOM_LANE_PREFIX):
-        return _finalize(
-            model_id[len(_CONFIGURED_CUSTOM_LANE_PREFIX):], "custom", config_base_url
-        )
+    if configured_custom_lane:
+        return _finalize(model_id, "custom", config_base_url)
 
     # Custom providers declared in config.yaml should win over slash-based
     # OpenRouter heuristics. Their model IDs commonly contain '/' too.
@@ -5021,11 +5028,13 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     # either: it goes through the custom_providers[] / providers: ownership
     # scans, so another endpoint listing the same id would take the request.
     # Nor is the configured provider's own hint (``@ollama:``), which picks up
-    # a same-named providers: / custom_providers[] record. The lane gets its
-    # own hint, resolved to ``model.base_url`` before any lookup. (#7955)
+    # a same-named providers: / custom_providers[] record, nor any other
+    # ``@<name>:`` text, which a providers.<name> entry of that name produces.
+    # The lane is carried as a type, resolved to ``model.base_url`` before any
+    # lookup. (#7955)
     if provider == "custom" and config_provider:
         if str(_resolve_provider_alias(config_provider) or "").strip().lower() == "custom":
-            return f"{_CONFIGURED_CUSTOM_LANE_PREFIX}{model}"
+            return _ConfiguredCustomLaneModel(model)
 
     # OpenRouter selections with slash IDs are explicit provider/model paths.
     if provider == "openrouter":

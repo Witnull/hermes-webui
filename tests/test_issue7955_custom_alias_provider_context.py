@@ -10,16 +10,19 @@ compared the two raw strings, saw a mismatch, and emitted
 ``@custom:qwen3.8:27b``. ``resolve_model_provider()`` then read the tag
 prefix as a named-provider slug: provider ``custom:qwen3.8``, model ``27b``.
 
-The fix gives that lane its own route hint, ``@custom-configured:<model>``,
-which ``resolve_model_provider()`` maps to ``(model, "custom",
-model.base_url)`` before it looks anything up by name. Two simpler shapes were
-tried and reviewed out:
+The fix marks that lane with a type, ``_ConfiguredCustomLaneModel``, which
+``resolve_model_provider()`` maps to ``(model, "custom", model.base_url)``
+before it looks anything up by name. Three other shapes were tried and reviewed
+out:
 
 * a bare id runs through the ``custom_providers[]`` / ``providers:`` ownership
   scans, where another endpoint listing the same id takes the request;
 * the configured provider's own hint (``@ollama:<model>``) skips those scans
   but picks up a ``providers.ollama`` or ``custom_providers[name=local]``
-  record of the same name, which the Custom lane never used.
+  record of the same name, which the Custom lane never used;
+* a reserved hint string (``@custom-configured:<model>``) is the same text a
+  ``providers.custom-configured`` entry produces, so it took that provider's
+  picks to the default endpoint and key.
 
 ``ollama -> custom`` lives in the agent's alias table
 (``hermes_cli.models._PROVIDER_ALIASES``), which the WebUI merges when the
@@ -81,9 +84,10 @@ def test_ollama_default_gives_the_custom_lane_its_own_hint(
     old = _set_config(provider="ollama", base_url=OLLAMA_BASE_URL, default="qwen3.8:27b")
     try:
         encoded = config.model_with_provider_context("qwen3.8:27b", "custom")
-        assert encoded == "@custom-configured:qwen3.8:27b", (
+        assert isinstance(encoded, config._ConfiguredCustomLaneModel), (
             f"session 'custom' is the configured provider here, got {encoded!r}"
         )
+        assert encoded == "qwen3.8:27b"
     finally:
         _restore(old)
 
@@ -126,7 +130,7 @@ def test_legacy_local_default_colon_tagged_model_roundtrip():
     old = _set_config(provider="local", base_url=OLLAMA_BASE_URL, default="qwen3.8:27b")
     try:
         encoded = config.model_with_provider_context("qwen3.8:27b", "custom")
-        assert encoded == "@custom-configured:qwen3.8:27b", f"got {encoded!r}"
+        assert isinstance(encoded, config._ConfiguredCustomLaneModel), f"got {encoded!r}"
         model, provider, base_url = config.resolve_model_provider(encoded)
         assert (model, provider, base_url) == ("qwen3.8:27b", "custom", OLLAMA_BASE_URL)
     finally:
@@ -339,3 +343,108 @@ def test_named_custom_session_under_ollama_default_keeps_hint(
         assert encoded == "@custom:lab:phi-5", f"got {encoded!r}"
     finally:
         _restore(old)
+
+
+# ── A provider named ``custom-configured`` keeps its own endpoint and key ─
+#
+# The lane is carried as a type, not as text, because any ``@<name>:<model>``
+# text is also what a ``providers.<name>`` entry produces. These run the real
+# chain: config.yaml on disk -> the picker catalog -> the session the UI stores
+# -> model_with_provider_context() -> resolve_model_provider() -> the agent's
+# runtime resolver, for the URL and the credential the request would carry.
+
+NAMED_BASE_URL = "http://127.0.0.1:18080/v1"
+DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
+_DEFAULTS = {
+    "configured-custom": (
+        "  provider: ollama\n"
+        f"  base_url: {DEFAULT_BASE_URL}\n"
+        "  api_key: review-fake-default-key\n"
+    ),
+    "non-custom": "  provider: openai\n  api_key: review-fake-openai-key\n",
+}
+
+
+def _install_config(monkeypatch, tmp_path, default):
+    import yaml
+
+    text = (
+        "model:\n"
+        f"{_DEFAULTS[default]}"
+        "  default: qwen3.8:27b\n"
+        "providers:\n"
+        "  custom-configured:\n"
+        f"    base_url: {NAMED_BASE_URL}\n"
+        "    api_key: review-fake-named-key\n"
+        "    models: [qwen3.8:27b, plainmodel]\n"
+    )
+    (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_BASE_HOME", str(tmp_path))
+    for name in list(__import__("os").environ):
+        if name.endswith("_API_KEY"):
+            monkeypatch.delenv(name)
+    monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
+    old = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update(yaml.safe_load(text))
+    config.invalidate_models_cache()
+    return old
+
+
+def _route(session_model, session_provider):
+    """What a send with this session state reaches: the resolved triple, then
+    the runtime's URL and credential for that provider."""
+    runtime_provider = pytest.importorskip("hermes_cli.runtime_provider")
+    from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+
+    model, provider, base_url = config.resolve_model_provider(
+        config.model_with_provider_context(session_model, session_provider)
+    )
+    runtime = resolve_runtime_provider_with_anthropic_env_lock(
+        runtime_provider.resolve_runtime_provider, requested=provider
+    )
+    return model, provider, base_url, runtime.get("base_url"), runtime.get("api_key")
+
+
+@pytest.mark.parametrize("default", sorted(_DEFAULTS))
+@pytest.mark.parametrize("model_id", ["qwen3.8:27b", "plainmodel"])
+def test_a_provider_named_custom_configured_keeps_its_endpoint_and_key(
+    monkeypatch, tmp_path, default, model_id
+):
+    old = _install_config(monkeypatch, tmp_path, default)
+    try:
+        groups = config.get_available_models()["groups"]
+        group = next(g for g in groups if g.get("provider_id") == "custom-configured")
+        (option,) = [m["id"] for m in group["models"] if m["id"].endswith(model_id)]
+        # The session the UI stores for that pick: the option id and its group.
+        route = _route(option, group["provider_id"])
+    finally:
+        _restore(old)
+        config.invalidate_models_cache()
+    assert route == (
+        model_id,
+        "custom-configured",
+        NAMED_BASE_URL,
+        NAMED_BASE_URL,
+        "review-fake-named-key",
+    )
+
+
+@pytest.mark.parametrize("model_id", ["qwen3.8:27b", "plainmodel"])
+def test_the_configured_custom_lane_beside_it_keeps_the_default_endpoint_and_key(
+    monkeypatch, tmp_path, model_id
+):
+    old = _install_config(monkeypatch, tmp_path, "configured-custom")
+    try:
+        route = _route(model_id, "custom")
+    finally:
+        _restore(old)
+        config.invalidate_models_cache()
+    assert route == (
+        model_id,
+        "custom",
+        DEFAULT_BASE_URL,
+        DEFAULT_BASE_URL,
+        "review-fake-default-key",
+    )
