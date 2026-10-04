@@ -1,0 +1,7 @@
+providers:
+  lmstudio:
+    base_url: http://localhost:8080/v1
+model:
+  provider: lmstudio
+  default: E:\Godseer\models\Spark-X2.5-4B-Q4_K_M.gguf
+  base_url: http://localhost:8080/v1
