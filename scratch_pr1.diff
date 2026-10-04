@@ -1,0 +1,1453 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 033ac40278d..51de5e01550 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,16 @@
+ 
+ ### Performance
+ 
++- **New Chat, Cmd/Ctrl+K and `/new` focus the composer without waiting for a second session-list read.**
++  `newSession()` already refreshes the sidebar (now forced, so the new row paints even while the pointer is over
++  the list), but each caller also awaited its own `renderSessionList()` before focusing. That queued a second full
++  `/api/sessions` + `/api/projects` read in front of the cursor, which held the composer for seconds on a long
++  session list. The button, the shortcut, `/new`, and the no-session branches of `/terminal` and `/goal` now rely on
++  `newSession()`'s refresh. (#7992, #7998 by @ybai08; #7936, #7996)
++- **Switching profiles keeps the skill-count cache.** `switch_profile()` used to clear every profile's cached skill
++  counts, so the next profile list re-parsed every profile's `SKILL.md` tree. Counts are keyed per profile directory,
++  so the cache now survives a switch; the mtime probe and 300 s TTL still catch real changes, and the active-org
++  marker is stored inside the cache entry so a marker change recomputes. (#7972 by @ybai08, part of #7940)
+ - **The all-profiles session list no longer computes every profile's skill counts.** Listing
+   sessions across all profiles (`/api/sessions?all_profiles=1`) called the profile-picker builder
+   only to learn the profile names, which also counted every profile's skills. It now adds the
+@@ -55,6 +65,13 @@
+ 
+ ### Security
+ 
++- **Public shares no longer 500 on large inline images, and never treat a `data:` URI as a file path.** A
++  conversation containing a `MEDIA:data:image/…` token over about 4 KB failed share creation with a
++  filename-too-long error, because the share builder tried to resolve the blob on disk. `data:` tokens now never touch
++  the filesystem: a raster image (PNG, JPEG, GIF, WebP) that passes the MIME allowlist, length and decoded-size caps,
++  strict base64 and a magic-byte check is re-emitted as a canonical `<img>`; anything else becomes the "attachment
++  omitted" placeholder. The local-file resolver also catches over-long or NUL-bearing paths instead of raising.
++  (#7961, fixes #7949)
+ - **The update check and workspace git no longer open credential prompts or trust checkout-controlled helpers.**
+   Unattended `git fetch`/`pull` from the update check, and the workspace git panel's operations, now run with a
+   scrubbed environment (`clean_git_env`: inherited `GIT_ASKPASS`, `GIT_SSH`, `GIT_CONFIG_*` and similar are removed)
+@@ -74,6 +91,12 @@
+ 
+ ### Fixed
+ 
++- **A Gateway turn that spans a WebUI restart streams again after the tab reattaches.** #7785 reattached such
++  runs, but the reopened tab showed only a spinner until the run ended, and only the final answer text was saved:
++  the reattach worker polled `GET /v1/runs/{id}` and never subscribed to `/v1/runs/{id}/events`. It now restores
++  what the run journal already holds, resumes the Gateway event stream after the last journaled sequence (so
++  nothing is replayed twice), and saves reasoning and tool activity with the Gateway's authoritative final output.
++  If the journal can't be read it stays poll-only instead of replaying the whole run. (#7878 by @carlotestor)
+ - **Clarify questions work with Agents that pass the batch as `questions=`.** Some Hermes Agent builds call the
+   WebUI clarify callback as `callback("", None, questions=[...])` instead of `callback([...])`. The adapter only
+   recognised the positional form, so it showed an empty single question and returned a plain string the Agent
+diff --git a/TESTING.md b/TESTING.md
+index d426a8a9976..d2956777cf7 100644
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -128,9 +128,10 @@ real model (it verifies the app *loads and initializes* cleanly — the brick cl
+ that breaks the page for everyone).
+ 
+ The same job then runs `tests/browser_new_chat_focus.py`, on the same agent-free
+-setup: with every `/api/sessions` response held, New Chat and Cmd/Ctrl+K must
+-focus the composer, read the session list once, and show the new row once the
+-list is released (#7936). Run it locally with `python tests/browser_new_chat_focus.py`.
++setup: with every `/api/sessions` response held, New Chat, Cmd/Ctrl+K and the
++typed `/new` command must focus the composer (and `/new` show its toast), read
++the session list once, and show the new row once the list is released (#7936,
++#7996). Run it locally with `python tests/browser_new_chat_focus.py`.
+ 
+ ## Public conversation lifecycle gate
+ 
+diff --git a/api/gateway_chat.py b/api/gateway_chat.py
+index 7e80993ac93..177945fbbf0 100644
+--- a/api/gateway_chat.py
++++ b/api/gateway_chat.py
+@@ -580,6 +580,11 @@ def _gateway_runs_approval_event(payload: dict) -> dict | None:
+     }
+ 
+ 
++def _gateway_approval_key(payload) -> str:
++    """Stable id for one gateway approval, shared by the status probe and the event relay."""
++    return str(payload.get("approval_id") or payload.get("id") or payload.get("timestamp") or "")
++
++
+ def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, *, put_gateway_event) -> None:
+     """Auto-approve or surface one runs-API approval request as a WebUI approval card."""
+     approval_data = _gateway_runs_approval_event(payload)
+@@ -599,6 +604,193 @@ def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key,
+         put_gateway_event("approval", {**(head or approval_data), "pending_count": total})
+ 
+ 
++def _note_live_gateway_event(stream_id: str, event_name: str, event_payload: dict) -> None:
++    """Mirror a relayed reasoning/tool event into the per-stream reconnect snapshot."""
++    if event_name == "reasoning":
++        reason_delta = event_payload.get("text")
++        if reason_delta and stream_id in STREAM_REASONING_TEXT:
++            STREAM_REASONING_TEXT[stream_id] += reason_delta
++    elif stream_id in STREAM_LIVE_TOOL_CALLS:
++        if event_name == "tool":
++            STREAM_LIVE_TOOL_CALLS[stream_id].append({
++                "name": event_payload.get("name"),
++                "args": event_payload.get("args") or {},
++                "done": False,
++                **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
++            })
++        elif event_name == "tool_complete":
++            for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
++                if shared_tc.get("done"):
++                    continue
++                if (
++                    event_payload.get("tid") and shared_tc.get("tid") == event_payload.get("tid")
++                ) or shared_tc.get("name") == event_payload.get("name"):
++                    shared_tc["done"] = True
++                    shared_tc["is_error"] = bool(event_payload.get("is_error"))
++                    break
++
++
++def _open_gateway_run_events(base_url, headers, run_id, last_seq: int = -1):
++    headers_sse = {**headers, "Accept": "text/event-stream"}
++    if last_seq >= 0:
++        headers_sse["Last-Event-ID"] = str(last_seq)
++    req = urllib.request.Request(
++        f"{base_url.rstrip('/')}/v1/runs/{urllib.parse.quote(run_id, safe='')}/events",
++        headers=headers_sse,
++        method="GET",
++    )
++    return urllib.request.urlopen(req, timeout=_gateway_read_timeout_secs())
++
++
++def _relay_gateway_run_events(
++    resp, session_id, stream_id, run_id, base_url, api_key,
++    *, put_gateway_event, cancel_event, on_seq=None, final_text="", stop_on_truncated=False,
++    surfaced_approval_ids=None, output_is_authoritative=False, approval_is_current=None,
++):
++    """Relay one /v1/runs/{id}/events stream; returns (text or None if cancelled, usage, outcome).
++
++    outcome is "ended", "eof", or "truncated" (the gateway dropped events after our cursor;
++    only returned with ``stop_on_truncated``, otherwise the retained events keep relaying).
++    Relayed payloads carry ``gateway_seq`` so the WebUI run journal records the gateway cursor;
++    ``on_seq`` commits each seq as soon as its event is relayed, so a reconnect never re-emits it.
++    ``surfaced_approval_ids`` is shared with the reattach status probe so one approval surfaces once.
++    ``output_is_authoritative`` lets ``run.completed.output`` replace streamed text (reattach: the
++    Agent may transform its answer after streaming). ``approval_is_current`` drops replayed approvals
++    the Gateway no longer has pending.
++    """
++    usage: dict = {}
++    outcome = "eof"
++    seq = None
++    sse_event = "message"
++
++    def emit(event_name, data):
++        if seq is not None and isinstance(data, dict):
++            data = {**data, "gateway_seq": seq}
++        put_gateway_event(event_name, data)
++
++    def commit():
++        nonlocal seq
++        if seq is not None and on_seq is not None:
++            on_seq(seq)
++        seq = None
++
++    for raw_line in _iter_sse_lines_cancellable(resp, cancel_event):
++        if cancel_event.is_set():
++            put_gateway_event("cancel", {"message": "Cancelled by user"})
++            return None, usage, "ended"
++        line = raw_line.decode("utf-8", errors="replace").strip()
++        if not line:
++            sse_event = "message"
++            continue
++        if line.startswith("event:"):
++            sse_event = line[6:].strip() or "message"
++            continue
++        if not line.startswith("data:"):
++            continue
++        data = line[5:].strip()
++        if data == "[DONE]":
++            break
++        try:
++            payload = json.loads(data)
++        except json.JSONDecodeError:
++            continue
++        if not isinstance(payload, dict):
++            continue
++        payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip() or "message"
++        seq = payload.get("seq") if isinstance(payload.get("seq"), int) else None
++        if payload_event == "replay.truncated":
++            if stop_on_truncated:
++                return final_text, usage, "truncated"
++            logger.info("Gateway replay for run %s truncated; relaying retained events", run_id)
++            sse_event = "message"
++            continue
++        if payload_event == "approval.request":
++            approval_key = _gateway_approval_key(payload)
++            already = surfaced_approval_ids is not None and approval_key in surfaced_approval_ids
++            if not already and (approval_is_current is None or approval_is_current(payload)):
++                if surfaced_approval_ids is not None and approval_key:
++                    surfaced_approval_ids.add(approval_key)
++                _relay_gateway_run_approval(
++                    session_id, run_id, payload, base_url, api_key,
++                    put_gateway_event=emit,
++                )
++            commit()
++            sse_event = "message"
++            continue
++        if payload_event in {"tool.started", "tool.completed", "reasoning.available"}:
++            translated = _gateway_tool_progress_event(payload)
++            if translated:
++                event_name, event_payload = translated
++                _note_live_gateway_event(stream_id, event_name, event_payload)
++                emit(event_name, event_payload)
++                if event_name != "reasoning":
++                    update_active_run(stream_id, phase="gateway-tool", latest_tool=event_payload.get("name"))
++            commit()
++            sse_event = "message"
++            continue
++        if payload_event == "message.delta":
++            delta = str(payload.get("delta") or "")
++            if delta:
++                final_text += delta
++                if stream_id in STREAM_PARTIAL_TEXT:
++                    STREAM_PARTIAL_TEXT[stream_id] += delta
++                emit("token", {"text": delta})
++            commit()
++            sse_event = "message"
++            continue
++        if payload_event == "run.completed":
++            from api.route_approvals import settle_gateway_pending_run
++            settle_gateway_pending_run(
++                session_id,
++                run_id,
++                reason="Gateway run completed before approval resolution",
++            )
++            if payload.get("error"):
++                raise RuntimeError(str(payload["error"]))
++            output = str(payload.get("output") or "")
++            if output and (output_is_authoritative or not final_text):
++                final_text = output
++                if stream_id in STREAM_PARTIAL_TEXT:
++                    STREAM_PARTIAL_TEXT[stream_id] = output
++            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
++            outcome = "ended"
++            commit()
++            sse_event = "message"
++            continue
++        if payload_event == "run.failed":
++            from api.route_approvals import settle_gateway_pending_run
++            settle_gateway_pending_run(
++                session_id,
++                run_id,
++                reason="Gateway run failed before approval resolution",
++            )
++            raise RuntimeError(str(payload.get("error") or "Gateway run failed"))
++        if payload_event == "run.cancelled":
++            from api.route_approvals import settle_gateway_pending_run
++            settle_gateway_pending_run(
++                session_id,
++                run_id,
++                reason="Gateway run was cancelled before approval resolution",
++            )
++            put_gateway_event("cancel", {"message": "Cancelled by gateway"})
++            return None, usage, "ended"
++        reasoning_delta = _gateway_sse_reasoning_delta(payload)
++        if reasoning_delta:
++            if stream_id in STREAM_REASONING_TEXT:
++                STREAM_REASONING_TEXT[stream_id] += reasoning_delta
++            emit("reasoning", {"text": reasoning_delta})
++        delta = _gateway_sse_delta(payload)
++        if delta:
++            final_text += delta
++            if stream_id in STREAM_PARTIAL_TEXT:
++                STREAM_PARTIAL_TEXT[stream_id] += delta
++            emit("token", {"text": delta})
++        usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
++        commit()
++    commit()
++    return final_text, usage, outcome
++
++
+ def _admit_gateway_run(url_runs, headers, run_body, stream_id) -> str:
+     """POST /v1/runs; the same stream and body return the originally admitted run id."""
+     req = urllib.request.Request(
+@@ -701,132 +893,15 @@ def _run_gateway_runs_api_streaming(
+         _finish_gateway_run_starting(stream_id)
+         raise
+ 
+-    usage: dict = {}
+     _publish_gateway_run_id(stream_id, run_id)
+     if on_run_id is not None:
+         on_run_id(run_id)
+ 
+-    url_events = f"{base_url.rstrip('/')}/v1/runs/{run_id}/events"
+-    headers_sse = dict(headers)
+-    headers_sse["Accept"] = "text/event-stream"
+-    req_events = urllib.request.Request(url_events, headers=headers_sse, method="GET")
+-    final_text = ""
+-    sse_event = "message"
+-    with urllib.request.urlopen(req_events, timeout=_gateway_read_timeout_secs()) as resp:
+-        for raw_line in _iter_sse_lines_cancellable(resp, cancel_event):
+-            if cancel_event.is_set():
+-                put_gateway_event("cancel", {"message": "Cancelled by user"})
+-                return None, usage
+-            line = raw_line.decode("utf-8", errors="replace").strip()
+-            if not line:
+-                sse_event = "message"
+-                continue
+-            if line.startswith("event:"):
+-                sse_event = line[6:].strip() or "message"
+-                continue
+-            if not line.startswith("data:"):
+-                continue
+-            data = line[5:].strip()
+-            if data == "[DONE]":
+-                break
+-            try:
+-                payload = json.loads(data)
+-            except json.JSONDecodeError:
+-                continue
+-            payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip() or "message"
+-            if payload_event == "approval.request":
+-                _relay_gateway_run_approval(
+-                    session_id, run_id, payload, base_url, api_key,
+-                    put_gateway_event=put_gateway_event,
+-                )
+-                sse_event = "message"
+-                continue
+-            if payload_event in {"tool.started", "tool.completed", "reasoning.available"}:
+-                translated = _gateway_tool_progress_event(payload)
+-                if translated:
+-                    event_name, event_payload = translated
+-                    if event_name == "reasoning":
+-                        reason_delta = event_payload.get("text")
+-                        if reason_delta and stream_id in STREAM_REASONING_TEXT:
+-                            STREAM_REASONING_TEXT[stream_id] += reason_delta
+-                    elif stream_id in STREAM_LIVE_TOOL_CALLS:
+-                        if event_name == "tool":
+-                            STREAM_LIVE_TOOL_CALLS[stream_id].append({
+-                                "name": event_payload.get("name"),
+-                                "args": event_payload.get("args") or {},
+-                                "done": False,
+-                                **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
+-                            })
+-                        elif event_name == "tool_complete":
+-                            for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
+-                                if shared_tc.get("done"):
+-                                    continue
+-                                if (
+-                                    event_payload.get("tid") and shared_tc.get("tid") == event_payload.get("tid")
+-                                ) or shared_tc.get("name") == event_payload.get("name"):
+-                                    shared_tc["done"] = True
+-                                    shared_tc["is_error"] = bool(event_payload.get("is_error"))
+-                                    break
+-                    put_gateway_event(event_name, event_payload)
+-                    if event_name != "reasoning":
+-                        update_active_run(stream_id, phase="gateway-tool", latest_tool=event_payload.get("name"))
+-                sse_event = "message"
+-                continue
+-            if payload_event == "message.delta":
+-                delta = str(payload.get("delta") or "")
+-                if delta:
+-                    final_text += delta
+-                    if stream_id in STREAM_PARTIAL_TEXT:
+-                        STREAM_PARTIAL_TEXT[stream_id] += delta
+-                    put_gateway_event("token", {"text": delta})
+-                sse_event = "message"
+-                continue
+-            if payload_event == "run.completed":
+-                from api.route_approvals import settle_gateway_pending_run
+-                settle_gateway_pending_run(
+-                    session_id,
+-                    run_id,
+-                    reason="Gateway run completed before approval resolution",
+-                )
+-                if payload.get("error"):
+-                    raise RuntimeError(str(payload["error"]))
+-                output = str(payload.get("output") or "")
+-                if output and not final_text:
+-                    final_text = output
+-                    if stream_id in STREAM_PARTIAL_TEXT:
+-                        STREAM_PARTIAL_TEXT[stream_id] = output
+-                usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
+-                sse_event = "message"
+-                continue
+-            if payload_event == "run.failed":
+-                from api.route_approvals import settle_gateway_pending_run
+-                settle_gateway_pending_run(
+-                    session_id,
+-                    run_id,
+-                    reason="Gateway run failed before approval resolution",
+-                )
+-                raise RuntimeError(str(payload.get("error") or "Gateway run failed"))
+-            if payload_event == "run.cancelled":
+-                from api.route_approvals import settle_gateway_pending_run
+-                settle_gateway_pending_run(
+-                    session_id,
+-                    run_id,
+-                    reason="Gateway run was cancelled before approval resolution",
+-                )
+-                put_gateway_event("cancel", {"message": "Cancelled by gateway"})
+-                return None, usage
+-            reasoning_delta = _gateway_sse_reasoning_delta(payload)
+-            if reasoning_delta:
+-                if stream_id in STREAM_REASONING_TEXT:
+-                    STREAM_REASONING_TEXT[stream_id] += reasoning_delta
+-                put_gateway_event("reasoning", {"text": reasoning_delta})
+-            delta = _gateway_sse_delta(payload)
+-            if delta:
+-                final_text += delta
+-                if stream_id in STREAM_PARTIAL_TEXT:
+-                    STREAM_PARTIAL_TEXT[stream_id] += delta
+-                put_gateway_event("token", {"text": delta})
+-            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
++    with _open_gateway_run_events(base_url, headers, run_id) as resp:
++        final_text, usage, _outcome = _relay_gateway_run_events(
++            resp, session_id, stream_id, run_id, base_url, api_key,
++            put_gateway_event=put_gateway_event, cancel_event=cancel_event,
++        )
+     return final_text, usage
+ 
+ 
+@@ -898,21 +973,105 @@ def _get_gateway_run_status(base_url: str, api_key: str, run_id: str) -> dict:
+     return payload if isinstance(payload, dict) else {}
+ 
+ 
++def _restore_relayed_gateway_state(session_id: str, stream_id: str) -> int | None:
++    """Rebuild live text/reasoning/tool state from this stream's run journal; return the replay cursor.
++
++    Relayed rows carry ``gateway_seq``, so the journal is the replay cursor; None (poll only) for rows without one
++    or when the journal cannot be read (an unread journal proves no cursor, so replaying from -1 would duplicate).
++    """
++    from api.run_journal import read_run_events
++
++    try:
++        events = read_run_events(session_id, stream_id).get("events") or []
++    except Exception:
++        logger.debug("Failed to read run journal for reattached stream %s", stream_id, exc_info=True)
++        return None
++    stateful, cursor = [], -1
++    for row in events:
++        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
++        seq = payload.get("gateway_seq")
++        if row.get("event") in {"token", "reasoning", "tool", "tool_complete"}:
++            if not isinstance(seq, int):
++                return None
++            stateful.append((row["event"], payload))
++        # Every relayed row (approval included) advances the cursor, not just the stateful ones.
++        if isinstance(seq, int):
++            cursor = max(cursor, seq)
++    for name, payload in stateful:
++        if name == "token":
++            STREAM_PARTIAL_TEXT[stream_id] = STREAM_PARTIAL_TEXT.get(stream_id, "") + str(payload.get("text") or "")
++        else:
++            _note_live_gateway_event(stream_id, name, payload)
++    return cursor
++
++
+ def _await_gateway_run_result(
+     session_id, stream_id, run_id, base_url, api_key,
+-    *, put_gateway_event, cancel_event,
++    *, put_gateway_event, cancel_event, resume_seq=None,
+ ):
+-    """Poll a run started by a previous WebUI process; same return contract as _run_gateway_runs_api_streaming."""
++    """Resume a run started by a previous WebUI process; same return contract as _run_gateway_runs_api_streaming.
++
++    Streams /events from ``resume_seq``; polls run status when replay is truncated, unavailable, or unaligned.
++    """
+     from api.route_approvals import settle_gateway_pending_run
+ 
+     _publish_gateway_run_id(stream_id, run_id)
+     update_active_run(stream_id, phase="gateway-reattached")
+     surfaced_approval_ids: set[str] = set()
+     failures = 0
++    last_seq = [resume_seq if resume_seq is not None else -1]
++    streaming = resume_seq is not None
++
++    def approval_is_current(payload):
++        # Auto-approved before the restart leaves no journal row; only the Gateway knows it is settled.
++        try:
++            status = _get_gateway_run_status(base_url, api_key, run_id)
++        except (urllib.error.URLError, OSError, ValueError):
++            return True  # fail open: a stale card 409s, a missing one stalls the run
++        approval = status.get("approval")
++        return (
++            str(status.get("status") or "").strip().lower() == "waiting_for_approval"
++            and isinstance(approval, dict)
++            and _gateway_approval_key(approval) == _gateway_approval_key(payload)
++        )
++
++    def surface_parked_approval(status):
++        approval = status.get("approval")
++        if str(status.get("status") or "").strip().lower() == "waiting_for_approval" and isinstance(approval, dict):
++            approval_key = _gateway_approval_key(approval)
++            if approval_key not in surfaced_approval_ids:
++                surfaced_approval_ids.add(approval_key)
++                _relay_gateway_run_approval(
++                    session_id, run_id, approval, base_url, api_key, put_gateway_event=put_gateway_event,
++                )
++
++    # Poll status before the first blocking /events read: an approval relayed before the restart sits
++    # behind the replay cursor, and a gateway without cursor replay never re-sends it at all.
++    probed = False
+     while True:
+         if cancel_event.is_set():
+             put_gateway_event("cancel", {"message": "Cancelled by user"})
+             return None, {}
++        if streaming and probed:
++            try:
++                with _open_gateway_run_events(base_url, _gateway_run_headers(session_id, api_key), run_id, last_seq[0]) as resp:
++                    text, usage, outcome = _relay_gateway_run_events(
++                        resp, session_id, stream_id, run_id, base_url, api_key,
++                        put_gateway_event=put_gateway_event, cancel_event=cancel_event,
++                        on_seq=lambda seq: last_seq.__setitem__(0, seq), final_text=STREAM_PARTIAL_TEXT.get(stream_id, ""),
++                        stop_on_truncated=True, surfaced_approval_ids=surfaced_approval_ids,
++                        output_is_authoritative=True, approval_is_current=approval_is_current,
++                    )
++                if outcome == "ended":
++                    return text, usage
++                if outcome == "truncated":
++                    logger.info("Gateway replay for run %s is truncated past seq %s; polling status", run_id, last_seq[0])
++                    streaming = False
++            except urllib.error.HTTPError:
++                streaming = False  # the status poll below classifies 404/401/403
++            except (urllib.error.URLError, OSError, ValueError):
++                logger.debug("Gateway event stream for run %s dropped; checking status", run_id, exc_info=True)
++        first_probe, probed = not probed, True
+         try:
+             status = _get_gateway_run_status(base_url, api_key, run_id)
+             failures = 0
+@@ -928,14 +1087,7 @@ def _await_gateway_run_result(
+             cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
+             continue
+         state = str(status.get("status") or "").strip().lower()
+-        approval = status.get("approval")
+-        if state == "waiting_for_approval" and isinstance(approval, dict):
+-            approval_key = str(approval.get("approval_id") or approval.get("id") or approval.get("timestamp") or "")
+-            if approval_key not in surfaced_approval_ids:
+-                surfaced_approval_ids.add(approval_key)
+-                _relay_gateway_run_approval(
+-                    session_id, run_id, approval, base_url, api_key, put_gateway_event=put_gateway_event,
+-                )
++        surface_parked_approval(status)
+         if state in _GATEWAY_RUN_TERMINAL_STATUSES:
+             settle_gateway_pending_run(session_id, run_id, reason=f"Gateway run {state} before approval resolution")
+             if state == "cancelled":
+@@ -947,7 +1099,8 @@ def _await_gateway_run_result(
+             if output and stream_id in STREAM_PARTIAL_TEXT:
+                 STREAM_PARTIAL_TEXT[stream_id] = output
+             return output, {k: v for k, v in _gateway_stream_usage(status).items() if v}
+-        cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
++        if not (streaming and first_probe):
++            cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
+ 
+ 
+ def resume_gateway_runs_after_restart() -> list[str]:
+@@ -1341,6 +1494,7 @@ def put_gateway_event(event, data):
+                         session_id, stream_id, run_id, base_url, api_key,
+                         put_gateway_event=put_gateway_event,
+                         cancel_event=cancel_event,
++                        resume_seq=_restore_relayed_gateway_state(session_id, stream_id),
+                     )
+                 else:
+                     final_text, usage = _run_gateway_runs_api_streaming(
+diff --git a/api/shares.py b/api/shares.py
+index af7b4a1f265..99705967342 100644
+--- a/api/shares.py
++++ b/api/shares.py
+@@ -9,6 +9,7 @@
+ from __future__ import annotations
+ 
+ import base64
++import binascii
+ import html
+ import io
+ import json
+@@ -120,10 +121,29 @@ def _redact_share_paths(text: str, extra_paths) -> str:
+ # Excludes MEDIA: followed by http/https URLs so external images pass
+ # through unchanged.  file:// references are NOT matched here — they are
+ # always rejected at the public-share boundary (absolute, un-scoped).
++# `data:` URIs DO match: _replace_ref() routes them to _embed_share_data_uri(),
++# which applies the same public-share policy as a local file (raster MIME
++# allow-list, byte cap, magic-byte check) and never touches the filesystem.
++# Feeding a multi-KB base64 blob to Path(...).resolve()/stat() raised OSError
++# ENAMETOOLONG (errno 36) and 500'd share creation (#7949); passing every data:
++# URI through unchanged would instead republish arbitrary bytes (text/plain,
++# octet-stream, SVG) that credential redaction cannot see.
+ _SHARE_MEDIA_RE = re.compile(
+     r"MEDIA:(?!https?://)([^\s\)\]>]+)"
+ )
+ 
++# Strict shape for an inline data URI: data:<type/subtype>[;param...];base64,<payload>.
++# Parameters (e.g. charset, name) are tolerated before the mandatory ;base64.
++_DATA_URI_RE = re.compile(
++    r"^data:(?P<mime>[a-z0-9.+-]+/[a-z0-9.+-]+)(?P<params>(?:;[^;,]*)*?);base64,(?P<payload>[A-Za-z0-9+/]*={0,2})$",
++    re.IGNORECASE,
++)
++# Normalise common aliases to the canonical names used by _SHARE_ALLOWED_MIME_TYPES.
++_DATA_URI_MIME_ALIASES = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg"}
++# Upper bound on the ENCODED payload, checked before decoding so an oversized
++# blob is refused without allocating its decoded bytes.
++_SHARE_EMBED_MAX_B64_CHARS = ((512 * 1024 + 2) // 3) * 4
++
+ # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
+ _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
+ 
+@@ -236,6 +256,44 @@ def _walk(elem: ET.Element) -> None:
+     return buf.getvalue()
+ 
+ 
++def _embed_share_data_uri(raw: str) -> str:
++    """Validate an inline ``data:`` media reference for a public share.
++
++    Applies the same policy as an embedded local file: only the raster types in
++    ``_SHARE_ALLOWED_MIME_TYPES``, strictly valid base64, at most
++    ``_SHARE_EMBED_MAX_BYTES`` decoded, and magic bytes that match the declared
++    type. A valid image is re-emitted as a canonical ``<img>`` built from the
++    decoded bytes; anything else (non-image, SVG, malformed, oversized,
++    mismatched magic, non-base64) becomes ``_PLACEHOLDER`` so none of its bytes
++    reach the public snapshot. Never touches the filesystem (#7949).
++    """
++    if len(raw) > _SHARE_EMBED_MAX_B64_CHARS + 256:
++        return _PLACEHOLDER
++    m = _DATA_URI_RE.match(raw)
++    if not m:
++        return _PLACEHOLDER
++    mime_type = m.group("mime").lower()
++    mime_type = _DATA_URI_MIME_ALIASES.get(mime_type, mime_type)
++    if mime_type not in _SHARE_ALLOWED_MIME_TYPES:
++        return _PLACEHOLDER
++    payload = m.group("payload")
++    if not payload or len(payload) > _SHARE_EMBED_MAX_B64_CHARS:
++        return _PLACEHOLDER
++    try:
++        data = base64.b64decode(payload, validate=True)
++    except (binascii.Error, ValueError):
++        return _PLACEHOLDER
++    if not data or len(data) > _SHARE_EMBED_MAX_BYTES:
++        return _PLACEHOLDER
++    if not _check_image_magic(data, mime_type):
++        return _PLACEHOLDER
++    b64 = base64.b64encode(data).decode("ascii")
++    return (
++        f'<img src="data:{mime_type};base64,{b64}"'
++        f' class="msg-media-img" alt="image" loading="lazy">'
++    )
++
++
+ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> str:
+     """Find local MEDIA: references and replace them with inline <img> tags.
+ 
+@@ -266,27 +324,38 @@ def _resolve_against_roots(raw: str) -> Path | None:
+         if raw.startswith("file://"):
+             return None
+ 
++        # Defensive length / newline guard (#7949). A real local attachment
++        # path is short; an over-long or newline-bearing token (e.g. a
++        # data:...;base64,<blob> URI that slipped past the caller) is never a
++        # valid file and must never be handed to the filesystem — a stat() on
++        # an over-length path raises OSError ENAMETOOLONG (errno 36), and that
++        # stat happens inside .is_file() below, OUTSIDE the resolve()
++        # try/except, so the error would otherwise escape and 500 the caller.
++        # 4096 comfortably exceeds any real PATH_MAX-bounded attachment path.
++        if len(raw) > 4096 or "\n" in raw or "\x00" in raw:
++            return None
++
+         # --- Absolute paths: resolve as-is, then allow-list check ------------
+         if raw.startswith("/") or raw.startswith("~"):
+             try:
+                 p = Path(raw).expanduser().resolve(strict=False)
++                if not allowed or not any(p.is_relative_to(r) for r in allowed):
++                    return None
++                return p if p.is_file() else None
+             except (OSError, ValueError, RuntimeError):
+                 return None
+-            if not allowed or not any(p.is_relative_to(r) for r in allowed):
+-                return None
+-            return p if p.is_file() else None
+ 
+         # --- Relative paths: try each allowed root as the anchor -------------
+         for root in allowed:
+             try:
+                 candidate = (root / raw).resolve(strict=False)
++                # Path traversal guard: resolved path must still be under root.
++                if not candidate.is_relative_to(root):
++                    continue
++                if candidate.is_file():
++                    return candidate
+             except (OSError, ValueError, RuntimeError):
+                 continue
+-            # Path traversal guard: resolved path must still be under the root.
+-            if not candidate.is_relative_to(root):
+-                continue
+-            if candidate.is_file():
+-                return candidate
+         return None
+ 
+     def _replace_ref(m: re.Match) -> str:
+@@ -298,6 +367,10 @@ def _replace_ref(m: re.Match) -> str:
+         if not raw:
+             return m.group(0)
+ 
++        # --- Inline data: URI — validate in memory, never resolve as a path ---
++        if raw[:5].lower() == "data:":
++            return _embed_share_data_uri(raw) + suffix
++
+         # --- Resolve and validate against allowed roots -----------------------
+         p = _resolve_against_roots(raw)
+         if p is None:
+diff --git a/static/commands.js b/static/commands.js
+index aed7e51d971..2b410fde708 100644
+--- a/static/commands.js
++++ b/static/commands.js
+@@ -922,7 +922,6 @@ async function cmdTerminal(){
+     // System-minted session (#6022): opening the terminal auto-creates a
+     // session — explicit worktree:false so the config default can't leak.
+     await newSession(false, {worktree: false});
+-    if(typeof renderSessionList==='function') await renderSessionList();
+   }
+   if(!S.session||!S.session.workspace){
+     showToast(t('terminal_no_workspace_title'),2600,'warning');
+@@ -934,8 +933,9 @@ async function cmdTerminal(){
+ 
+ async function cmdNew(){
+   if(typeof clearCompressionUi==='function') clearCompressionUi();
++  // newSession() refreshes the sidebar itself; a second awaited render only
++  // queued another full list read in front of the focus (#7996).
+   await newSession();
+-  await renderSessionList();
+   $('msg').focus();
+   showToast(t('new_session'));
+ }
+@@ -1367,7 +1367,7 @@ async function cmdStop(){
+ }
+ 
+ async function cmdGoal(args){
+-  if(!S.session){await newSession();await renderSessionList();}
++  if(!S.session){await newSession();}
+   if(!S.session||!S.session.session_id){showToast(t('no_active_session'));return;}
+   const activeSid=S.session.session_id;
+   try{
+diff --git a/tests/browser_new_chat_focus.py b/tests/browser_new_chat_focus.py
+index d4a8d195d8f..1942fb5bf91 100644
+--- a/tests/browser_new_chat_focus.py
++++ b/tests/browser_new_chat_focus.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """
+ Headless browser gate: a fresh chat focuses the composer without waiting for the
+-session list (#7936).
++session list (#7936, and /new in #7996).
+ 
+ WHY THIS EXISTS
+   `newSession()` already schedules the sidebar refresh in the background. The
+@@ -10,9 +10,9 @@
+   only after the first one's `/api/sessions` and `/api/projects` reads finish.
+   On a long session list that held the composer for seconds.
+ 
+-WHAT IT CHECKS, for the button and for Cmd/Ctrl+K
+-  - with every `/api/sessions` response held, the composer is focused and the
+-    new blank conversation is current;
++WHAT IT CHECKS, for the button, Cmd/Ctrl+K and the /new command
++  - with every `/api/sessions` response held, the composer is focused (and for
++    /new, its toast is shown) and the new blank conversation is current;
+   - one fresh-chat action issues one session-list read;
+   - once the held reads are released, the new conversation's sidebar row appears.
+ 
+@@ -27,7 +27,7 @@
+   (Requires: playwright + chromium.)
+ 
+ EXIT CODES
+-  0 — both paths passed
++  0 — every path passed
+   1 — a check failed (regression)
+   2 — environment/setup failure (server didn't boot, playwright missing, etc.)
+ """
+@@ -75,11 +75,40 @@ def _wait_until(page, expression, timeout_ms):
+ 
+ 
+ def _start_fresh_chat(page, trigger):
++    """Start a fresh chat via ``trigger``; return failure lines for the driver itself."""
+     if trigger == "button":
+         page.click("#btnNewChat")
++    elif trigger == "slash":
++        # The first slash command after page load starts the skill, bundle and agent
++        # metadata loaders; each one re-opens the autocomplete when it lands, which can
++        # swallow the second Enter. Warm them first so the typed sequence is
++        # deterministic (the race is in this driver, not in /new).
++        page.evaluate(
++            "() => Promise.all([loadSkillCommands(), loadBundleCommands(),"
++            " loadAgentCommandMetadata()])"
++        )
++        # As typed: the first Enter takes the open autocomplete, the second sends.
++        page.click("#msg")
++        page.keyboard.type("/new")
++        if not _wait_until(page, "!!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
++            return ["  [slash] the /new autocomplete never opened"]
++        page.keyboard.press("Enter")
++        if not _wait_until(page, "!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
++            return ["  [slash] the autocomplete did not close after taking /new"]
++        page.keyboard.press("Enter")
+     else:
+         page.evaluate("document.activeElement && document.activeElement.blur()")
+         page.keyboard.press("Meta+k" if sys.platform == "darwin" else "Control+k")
++    return []
++
++
++def _done(trigger):
++    """What the trigger shows once it has finished. /new is typed in the composer,
++    so focus alone proves nothing there: its toast comes after the same await."""
++    focused = "!!(document.activeElement && document.activeElement.id === 'msg')"
++    if trigger == "slash":
++        return focused + " && $('toast').dataset.toastMessage === t('new_session')"
++    return focused
+ 
+ 
+ def _check(browser, trigger):
+@@ -109,11 +138,13 @@ def _check(browser, trigger):
+     page.route("**/api/sessions*", lambda route: held.append(route)
+                if _is_session_list(route.request.url) else route.continue_())
+ 
+-    _start_fresh_chat(page, trigger)
+-    focused = "!!(document.activeElement && document.activeElement.id === 'msg')"
+-    if not _wait_until(page, focused, FOCUS_TIMEOUT_MS):
++    driver_failures = _start_fresh_chat(page, trigger)
++    if driver_failures:
++        failures.extend(driver_failures)
++    elif not _wait_until(page, _done(trigger), FOCUS_TIMEOUT_MS):
+         failures.append(
+-            f"  [{trigger}] composer not focused within {FOCUS_TIMEOUT_MS} ms "
++            f"  [{trigger}] not finished (composer focused"
++            f"{', toast shown' if trigger == 'slash' else ''}) within {FOCUS_TIMEOUT_MS} ms "
+             f"while the session list was held ({len(held)} list read(s) held)"
+         )
+     after = page.evaluate("S.session && S.session.session_id")
+@@ -189,7 +220,7 @@ def main():
+             browser = pw.chromium.launch(
+                 headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+             )
+-            for trigger in ("button", "shortcut"):
++            for trigger in ("button", "shortcut", "slash"):
+                 failures.extend(_check(browser, trigger))
+             browser.close()
+ 
+diff --git a/tests/test_gateway_run_reattach_after_restart.py b/tests/test_gateway_run_reattach_after_restart.py
+index 267c51cb486..f59a64e19fc 100644
+--- a/tests/test_gateway_run_reattach_after_restart.py
++++ b/tests/test_gateway_run_reattach_after_restart.py
+@@ -16,6 +16,8 @@
+ from api import profiles
+ from api.models import new_session
+ 
++_REAL_OPEN_EVENTS = gateway_chat._open_gateway_run_events
++
+ 
+ @pytest.fixture
+ def isolated_sessions(tmp_path, monkeypatch):
+@@ -33,9 +35,17 @@ def isolated_sessions(tmp_path, monkeypatch):
+         "status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": [],
+     })
+     monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
++    # Default: a gateway without event replay, so reattach falls back to status polling.
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", _events_http_error(404))
+     return session_dir
+ 
+ 
++def _events_http_error(code):
++    def fail(base_url, headers, run_id, last_seq=-1):
++        raise urllib.error.HTTPError(f"{base_url}/v1/runs/{run_id}/events", code, "no", Message(), io.BytesIO(b""))
++    return fail
++
++
+ def _orphaned_gateway_turn(run_id="run_survivor", stream_id="stream-before-restart"):
+     """Persist the sidecar exactly as a WebUI process leaves it when killed mid-run."""
+     s = new_session()
+@@ -93,6 +103,7 @@ def fake_urlopen(req, timeout=None):
+ 
+     monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a, **k: True)
+     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", _REAL_OPEN_EVENTS)
+     with STREAMS_LOCK:
+         STREAMS[stream_id] = create_stream_channel()
+ 
+@@ -109,6 +120,43 @@ def fake_urlopen(req, timeout=None):
+     assert saved["messages"][-1]["content"] == "done"
+ 
+ 
++def test_live_send_keeps_relaying_after_initial_replay_truncated(isolated_sessions, monkeypatch):
++    s = new_session()
++    stream_id = "stream-live-trunc"
++    s.active_stream_id = stream_id
++    s.pending_user_message = "hi"
++    s.pending_attachments = []
++    s.pending_started_at = 123.0
++    s.save()
++
++    def fake_urlopen(req, timeout=None):
++        if req.get_method() == "POST":
++            return io.BytesIO(b'{"run_id":"run_live_trunc"}')
++        return io.BytesIO(
++            b'data: {"event":"replay.truncated","oldest_retained_seq":1200}\n\n'
++            b'data: {"event":"message.delta","delta":"kept answer","seq":1200}\n\n'
++            b'data: {"event":"run.completed","output":"kept answer","seq":1201}\n\n'
++            b"data: [DONE]\n\n"
++        )
++
++    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a, **k: True)
++    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", _REAL_OPEN_EVENTS)
++    monkeypatch.setattr(
++        gateway_chat, "_get_gateway_run_status",
++        lambda *a: pytest.fail("live send must not fall back to status polling"),
++    )
++    with STREAMS_LOCK:
++        STREAMS[stream_id] = create_stream_channel()
++
++    gateway_chat._run_gateway_chat_streaming(s.session_id, "hi", "test-model", "/tmp", stream_id, [])
++
++    saved = _saved(s.session_id)
++    assert saved["active_stream_id"] is None
++    assert saved["messages"][-1]["role"] == "assistant"
++    assert saved["messages"][-1]["content"] == "kept answer"
++
++
+ def test_restart_reattaches_and_writes_back_real_answer(isolated_sessions, monkeypatch):
+     sid, stream_id = _orphaned_gateway_turn()
+     release = threading.Event()
+@@ -528,3 +576,304 @@ def fake_respond(self, run_id, approval_id, choice):
+         streaming.cancel_stream(stream_id)
+         _wait_for_reattach_threads()
+         approvals._pending.pop(sid, None)
++
++
++def _sse(*payloads):
++    frames = []
++    for seq, payload in payloads:
++        frames.append(f"id: {seq}\n".encode() if seq is not None else b"")
++        body = dict(payload, **({"seq": seq} if seq is not None else {}))
++        frames.append(f"data: {json.dumps(body)}\n\n".encode())
++    return io.BytesIO(b"".join(frames))
++
++
++def _journal(sid, stream_id):
++    from api.run_journal import read_run_events
++    return read_run_events(sid, stream_id)["events"]
++
++
++def _relayed_before_restart(sid, stream_id, rows):
++    """Journal rows exactly as the pre-restart worker relayed them."""
++    from api.run_journal import append_run_event
++    for event, payload in rows:
++        append_run_event(sid, stream_id, event, payload)
++
++
++def test_reattach_streams_from_the_journal_cursor_and_keeps_reasoning_and_tools(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_live_after_restart")
++    _relayed_before_restart(sid, stream_id, [
++        ("context_status", {"session_id": sid}),
++        ("reasoning", {"text": "plan. ", "gateway_seq": 0}),
++        ("tool", {"name": "terminal", "args": {"command": "ls"}, "tid": "t1", "gateway_seq": 1}),
++        ("tool_complete", {"name": "terminal", "tid": "t1", "is_error": False, "gateway_seq": 2}),
++        ("token", {"text": "Before ", "gateway_seq": 3}),
++    ])
++    opened = []
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append((run_id, last_seq))
++        return _sse(
++            (4, {"event": "reasoning.available", "text": "then check."}),
++            (5, {"event": "tool.started", "tool": "read_file", "toolCallId": "t2", "args": {"path": "a"}}),
++            (6, {"event": "tool.completed", "tool": "read_file", "toolCallId": "t2"}),
++            (7, {"event": "message.delta", "delta": "after."}),
++            (8, {"event": "run.completed", "output": "Before after.", "usage": {"input_tokens": 5}}),
++        )
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    probes = []
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: probes.append(r) or {"run_id": r, "status": "running"})
++
++    assert gateway_chat.resume_gateway_runs_after_restart() == [sid]
++    _wait_for_reattach_threads()
++
++    assert opened == [("run_live_after_restart", 3)]
++    assert probes == ["run_live_after_restart"]  # one parked-approval probe, then no polling
++    relayed = [(e["event"], e["payload"].get("gateway_seq")) for e in _journal(sid, stream_id)]
++    # Reopened tabs replay these from the WebUI journal: live text, tool cards and reasoning after the restart.
++    assert [r for r in relayed if r[1] is not None and r[1] >= 4] == [
++        ("reasoning", 4), ("tool", 5), ("tool_complete", 6), ("token", 7),
++    ]
++    assert relayed[-2:] == [("done", None), ("stream_end", None)]
++    saved = _saved(sid)
++    final = saved["messages"][-1]
++    assert final["content"] == "Before after."
++    assert final["reasoning"] == "plan. then check."
++    assert saved["active_stream_id"] is None and saved["gateway_run"] is None
++
++
++def test_reattach_reconnects_after_the_event_stream_drops(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_flaky")
++    opened = []
++    streams = iter([
++        _sse((0, {"event": "message.delta", "delta": "one "})),  # EOF before the run ends
++        _sse((1, {"event": "message.delta", "delta": "two"}), (2, {"event": "run.completed", "output": "one two"})),
++    ])
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)
++        return next(streams)
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {"run_id": r, "status": "running"})
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert opened == [-1, 0]
++    assert _saved(sid)["messages"][-1]["content"] == "one two"
++
++
++@pytest.mark.parametrize("why", ["truncated", "unaligned_journal"])
++def test_reattach_falls_back_to_status_polling(isolated_sessions, monkeypatch, why):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_fallback")
++    opened = []
++    if why == "unaligned_journal":
++        # Relayed by a WebUI that did not record gateway seqs: no safe cursor exists.
++        _relayed_before_restart(sid, stream_id, [("token", {"text": "partial"})])
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)
++        return _sse((None, {"event": "replay.truncated", "oldest_retained_seq": 40}), (40, {"event": "message.delta", "delta": "x"}))
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    statuses = iter(["running"])  # the pre-stream probe sees the run still going
++    monkeypatch.setattr(
++        gateway_chat, "_get_gateway_run_status",
++        lambda b, k, r: {"run_id": r, "status": next(statuses, "completed"), "output": "full answer from status"},
++    )
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert opened == ([-1] if why == "truncated" else [])
++    assert _saved(sid)["messages"][-1]["content"] == "full answer from status"
++    assert not any(e["event"] == "token" and e["payload"].get("text") == "x" for e in _journal(sid, stream_id))
++
++
++def test_reattach_polls_without_replay_when_the_journal_read_fails(isolated_sessions, monkeypatch):
++    from api import run_journal
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_journal_unreadable")
++    _relayed_before_restart(sid, stream_id, [("token", {"text": "A", "gateway_seq": 0})])
++    real_read, failed = run_journal.read_run_events, []
++
++    def read_once_broken(*args, **kwargs):
++        if not failed:
++            failed.append(True)
++            raise OSError("journal unreadable")
++        return real_read(*args, **kwargs)
++
++    monkeypatch.setattr(run_journal, "read_run_events", read_once_broken)
++    opened = []
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)
++        return _sse((0, {"event": "message.delta", "delta": "A"}), (1, {"event": "message.delta", "delta": "B"}))
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    statuses = iter(["running"])  # the pre-stream probe sees the run still going
++    monkeypatch.setattr(
++        gateway_chat, "_get_gateway_run_status",
++        lambda b, k, r: {"run_id": r, "status": next(statuses, "completed"), "output": "AB"},
++    )
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert failed and opened == []  # an unread journal proves no cursor: poll only
++    tokens = [(e["payload"].get("gateway_seq"), e["payload"].get("text")) for e in _journal(sid, stream_id) if e["event"] == "token"]
++    assert tokens == [(0, "A")]
++    saved = _saved(sid)
++    assert saved["messages"][-1]["content"] == "AB"
++    assert saved["active_stream_id"] is None and saved["gateway_run"] is None
++
++
++def test_reattach_resurfaces_an_approval_relayed_before_the_restart(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_stream")
++    _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
++    parked = {"event": "approval.request", "approval_id": "appr-9", "command": "rm x", "description": "d"}
++    relayed = []
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {
++        "run_id": r, "status": "waiting_for_approval", "approval": parked,
++    })
++    monkeypatch.setattr(
++        gateway_chat, "_relay_gateway_run_approval",
++        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]),
++    )
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", lambda b, h, r, last_seq=-1: _sse(
++        (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"}),
++    ))
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert relayed == ["appr-9"]
++    assert _saved(sid)["messages"][-1]["content"] == "checking done"
++
++
++def test_reattach_cursor_includes_a_journaled_approval_so_it_is_not_relayed_twice(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_journaled")
++    parked = {"event": "approval.request", "approval_id": "appr-7", "command": "rm y", "description": "d"}
++    _relayed_before_restart(sid, stream_id, [
++        ("token", {"text": "checking ", "gateway_seq": 0}),
++        ("approval", {"approval_id": "appr-7", "command": "rm y", "pending_count": 1, "gateway_seq": 1}),
++    ])
++    relayed, opened = [], []
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {
++        "run_id": r, "status": "waiting_for_approval", "approval": parked,
++    })
++    monkeypatch.setattr(
++        gateway_chat, "_relay_gateway_run_approval",
++        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]),
++    )
++    history = [(1, parked), (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"})]
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)  # sent as Last-Event-ID; the gateway replays only seq > last_seq
++        return _sse(*[(s, p) for s, p in history if s > last_seq])
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert opened == [1]
++    assert relayed == ["appr-7"]
++    assert _saved(sid)["messages"][-1]["content"] == "checking done"
++
++
++class _ResetAfter(io.BytesIO):
++    """An event stream whose connection resets once its bytes are consumed."""
++
++    def __next__(self):
++        line = self.readline()
++        if not line:
++            raise ConnectionResetError("reset by peer")
++        return line
++
++
++def test_reattach_cursor_commits_an_event_as_soon_as_it_is_relayed(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_reset_mid_frame")
++    _relayed_before_restart(sid, stream_id, [("token", {"text": "", "gateway_seq": 0})])
++    history = [(1, {"event": "message.delta", "delta": "A"}), (2, {"event": "run.completed", "output": "A"})]
++    opened = []
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)
++        if len(opened) == 1:
++            # Token A arrives, then the connection resets before the blank frame separator.
++            return _ResetAfter(b"id: 1\n" + f"data: {json.dumps(dict(history[0][1], seq=1))}\n".encode())
++        return _sse(*[(s, p) for s, p in history if s > last_seq])
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {"run_id": r, "status": "running"})
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert opened == [0, 1]
++    assert [e["payload"]["text"] for e in _journal(sid, stream_id) if e["event"] == "token" and e["payload"].get("text")] == ["A"]
++    assert _saved(sid)["messages"][-1]["content"] == "A"
++
++
++@pytest.mark.parametrize("journaled", [True, False], ids=["cursor", "empty_journal"])
++def test_reattach_probe_and_replay_surface_one_approval_once(isolated_sessions, monkeypatch, journaled):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_replayed")
++    if journaled:
++        _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
++    parked = {"event": "approval.request", "approval_id": "appr-3", "command": "rm z", "description": "d"}
++    order = []
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: order.append("probe") or {
++        "run_id": r, "status": "waiting_for_approval", "approval": parked,
++    })
++    monkeypatch.setattr(
++        gateway_chat, "_relay_gateway_run_approval",
++        lambda session_id, run_id, payload, *a, **k: order.append(("approval", payload["approval_id"])),
++    )
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        order.append("events")
++        # The gateway replays the still-pending approval after the cursor.
++        return _sse((1, parked), (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"}))
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    # The status probe runs before the first blocking /events read, whatever the cursor.
++    assert order == ["probe", ("approval", "appr-3"), "events"]
++    assert _saved(sid)["messages"][-1]["content"].endswith("done")
++
++
++def test_reattach_saves_the_run_output_over_the_restored_partial(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_transformed")
++    _relayed_before_restart(sid, stream_id, [("token", {"text": "raw", "gateway_seq": 0})])
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {"run_id": r, "status": "running"})
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", lambda b, h, r, last_seq=-1: _sse(
++        (1, {"event": "run.completed", "output": "transformed"}),
++    ))
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    # The Agent can rewrite its answer after streaming; run.completed.output is the final answer.
++    assert _saved(sid)["messages"][-1]["content"] == "transformed"
++
++
++def test_reattach_drops_a_replayed_approval_the_gateway_already_settled(isolated_sessions, monkeypatch):
++    sid, stream_id = _orphaned_gateway_turn(run_id="run_auto_approved")
++    _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
++    stale = {"event": "approval.request", "approval_id": "appr-auto", "command": "ls", "description": "d"}
++    relayed, opened = [], []
++    # Auto-approved before the restart (no journal row): the run is running again, nothing parked.
++    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {"run_id": r, "status": "running"})
++    monkeypatch.setattr(
++        gateway_chat, "_relay_gateway_run_approval",
++        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]),
++    )
++    history = [(1, stale), (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"})]
++
++    def open_events(base_url, headers, run_id, last_seq=-1):
++        opened.append(last_seq)
++        return _sse(*[(s, p) for s, p in history if s > last_seq])
++
++    monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", open_events)
++    gateway_chat.resume_gateway_runs_after_restart()
++    _wait_for_reattach_threads()
++
++    assert relayed == []
++    assert opened == [0]
++    assert _saved(sid)["messages"][-1]["content"] == "checking done"
+diff --git a/tests/test_issue7949_share_inline_image_data_uri.py b/tests/test_issue7949_share_inline_image_data_uri.py
+new file mode 100644
+index 00000000000..72b48742580
+--- /dev/null
++++ b/tests/test_issue7949_share_inline_image_data_uri.py
+@@ -0,0 +1,173 @@
++"""Regression tests for #7949: public-share creation 500s on an inline image.
++
++A conversation containing an inline-image MEDIA token — ``MEDIA:data:image/
++...;base64,<blob>`` — whose data URI was longer than ~4 KB made
++``build_share_snapshot`` / ``_embed_share_media`` raise
++``OSError: [Errno 36] File name too long`` (ENAMETOOLONG) and return HTTP 500.
++
++Root cause: the whole base64 blob became the ``raw`` "path" and
++``_resolve_against_roots`` stat()ed it outside its try/except.
++
++The fix routes ``data:`` tokens to an in-memory validator that applies the
++same public-share policy as a local file (raster MIME allow-list, strict
++base64, byte cap, magic bytes) and never touches the filesystem. A valid
++raster image survives as an ``<img>``; every other data URI (text, octet-stream,
++SVG, malformed, oversized, mismatched magic) is replaced by the placeholder, so
++none of its bytes can reach the public snapshot JSON. ``_resolve_against_roots``
++also keeps a defensive length/newline/NUL guard.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++from pathlib import Path
++
++import pytest
++
++from api import shares
++
++PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
++SECRET = "sk-live-THIS-MUST-NOT-APPEAR-1234567890"
++
++
++def _embed(text: str, roots):
++    return shares._embed_share_media(text, allowed_roots=tuple(roots))
++
++
++def _b64(data: bytes) -> str:
++    return base64.b64encode(data).decode("ascii")
++
++
++class _FakeSession:
++    def __init__(self, tmp_path: Path, messages):
++        self.session_id = "s-7949"
++        self.title = "Share test"
++        self.messages = messages
++        self.workspace = str(tmp_path / "workspace")
++        self.created_at = 0
++        self.updated_at = 0
++
++    def to_dict(self):
++        return {
++            "session_id": self.session_id,
++            "title": self.title,
++            "messages": self.messages,
++            "workspace": self.workspace,
++        }
++
++
++def _snapshot_json(tmp_path: Path, content: str) -> str:
++    (tmp_path / "workspace").mkdir(exist_ok=True)
++    session = _FakeSession(
++        tmp_path,
++        [
++            {"role": "user", "content": "render it"},
++            {"role": "assistant", "content": content},
++        ],
++    )
++    return json.dumps(shares.build_share_snapshot(session))
++
++
++def test_valid_png_data_uri_survives_as_image(tmp_path: Path):
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    out = _embed(f"Chart: MEDIA:data:image/png;base64,{_b64(PNG)} done", [ws])
++    assert f'<img src="data:image/png;base64,{_b64(PNG)}"' in out
++    assert shares._PLACEHOLDER not in out
++    assert out.endswith(" done")
++
++
++@pytest.mark.parametrize("blob_len", [5_000, 60_000, 400_000])
++def test_large_valid_png_does_not_crash_and_survives(tmp_path: Path, blob_len):
++    """The exact #7949 crash shape: a >4 KB inline image must not raise."""
++    big = PNG + b"\x00" * blob_len
++    snap = _snapshot_json(tmp_path, f"Here: MEDIA:data:image/png;base64,{_b64(big)}")
++    assert "data:image/png;base64," in snap
++
++
++def test_mixed_case_scheme_and_jpg_alias(tmp_path: Path):
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 32
++    out = _embed(f"MEDIA:DATA:Image/JPG;base64,{_b64(jpeg)}", [ws])
++    assert '<img src="data:image/jpeg;base64,' in out
++
++
++@pytest.mark.parametrize(
++    "uri",
++    [
++        f"data:text/plain;base64,{_b64(SECRET.encode())}",
++        f"data:application/octet-stream;base64,{_b64(SECRET.encode())}",
++        "data:image/svg+xml;base64,"
++        + _b64(f'<svg xmlns="http://www.w3.org/2000/svg"><text>{SECRET}</text></svg>'.encode()),
++        # declared PNG, but the bytes are text: magic-byte mismatch
++        f"data:image/png;base64,{_b64(SECRET.encode())}",
++        # not base64 at all (URL-encoded form)
++        "data:image/png,%89PNG" + SECRET,
++        # malformed base64 alphabet
++        "data:image/png;base64,@@@" + SECRET,
++    ],
++)
++def test_unsafe_data_uris_never_reach_snapshot(tmp_path: Path, uri):
++    snap = _snapshot_json(tmp_path, f"leak: MEDIA:{uri} end")
++    assert SECRET not in snap
++    assert _b64(SECRET.encode()) not in snap
++    assert shares._PLACEHOLDER in snap
++
++
++def test_oversized_png_is_placeholdered_without_decoding(tmp_path: Path):
++    huge = PNG + b"\x00" * (shares._SHARE_EMBED_MAX_BYTES + 1)
++    snap = _snapshot_json(tmp_path, f"MEDIA:data:image/png;base64,{_b64(huge)}")
++    assert "data:image/png;base64," not in snap
++    assert shares._PLACEHOLDER in snap
++
++
++def test_data_uri_never_reaches_filesystem(tmp_path: Path, monkeypatch):
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    calls = []
++    real = shares.Path.resolve
++
++    def _spy(self, *a, **k):
++        if "base64" in str(self):
++            calls.append(str(self)[:40])
++        return real(self, *a, **k)
++
++    monkeypatch.setattr(shares.Path, "resolve", _spy)
++    for uri in (
++        f"data:image/png;base64,{_b64(PNG + b'0' * 9000)}",
++        f"data:text/plain;base64,{_b64(b'x' * 9000)}",
++        "DATA:image/png;base64,!!!" + "A" * 9000,
++    ):
++        _embed(f"MEDIA:{uri}", [ws])
++    assert calls == []
++
++
++def test_real_local_image_still_embeds(tmp_path: Path):
++    """Regression guard: the fix must not break normal local-file embedding."""
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    (ws / "ok.png").write_bytes(PNG)
++    out = _embed("See MEDIA:ok.png here", [ws])
++    assert '<img src="data:image/png;base64,' in out
++    assert shares._PLACEHOLDER not in out
++
++
++def test_http_url_still_passes_through(tmp_path: Path):
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    out = _embed("x MEDIA:https://example.com/a.png y", [ws])
++    assert "MEDIA:https://example.com/a.png" in out
++
++
++def test_resolver_rejects_overlong_token_without_raising(tmp_path: Path):
++    """Belt-and-suspenders: _resolve_against_roots must fail closed, never
++    raise, on an over-length / newline / NUL relative token."""
++    ws = tmp_path / "workspace"
++    ws.mkdir()
++    # "a"*300 + ".png" is under the 4096 guard but over NAME_MAX for one path
++    # component, so it exercises the is_file() probe moved inside try/except.
++    for raw in ("x" * 5000, "a" * 300 + ".png", "a\nb.png", "a\x00b.png"):
++        out = _embed(f"MEDIA:{raw}", [ws])
++        assert '<img src="data:' not in out
+diff --git a/tests/test_issue7996_new_command_focus.py b/tests/test_issue7996_new_command_focus.py
+new file mode 100644
+index 00000000000..040fd51a5cf
+--- /dev/null
++++ b/tests/test_issue7996_new_command_focus.py
+@@ -0,0 +1,44 @@
++"""#7996: /new and the other slash-command callers of newSession() do not await a
++second session-list render.
++
++newSession() refreshes the sidebar itself (forced, see #7936). An awaited
++renderSessionList() after it queued a second full /api/sessions read in front of
++whatever came next: the composer focus and toast for /new, opening the terminal
++for /terminal with no session, and the goal request for /goal with no session.
++tests/browser_new_chat_focus.py drives /new with the list response held.
++"""
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++COMMANDS_JS = (ROOT / "static" / "commands.js").read_text(encoding="utf-8")
++SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
++
++
++def _function(name: str) -> str:
++    start = COMMANDS_JS.index(f"async function {name}(")
++    return COMMANDS_JS[start : COMMANDS_JS.index("\n}\n", start)]
++
++
++def test_new_focuses_and_toasts_right_after_new_session():
++    body = _function("cmdNew")
++    assert "await newSession();\n  $('msg').focus();\n  showToast(t('new_session'));" in body
++    assert "renderSessionList" not in body
++
++
++def test_terminal_does_not_await_a_list_render_after_creating_a_session():
++    body = _function("cmdTerminal")
++    assert "await newSession(false, {worktree: false});" in body
++    assert "await renderSessionList" not in body
++
++
++def test_goal_does_not_await_a_list_render_after_creating_a_session():
++    body = _function("cmdGoal")
++    assert "if(!S.session){await newSession();}" in body
++    # A later fire-and-forget render after the goal is set stays.
++    assert "await renderSessionList" not in body
++
++
++def test_new_session_still_owns_a_forced_sidebar_refresh():
++    start = SESSIONS_JS.index("async function newSession(")
++    body = SESSIONS_JS[start : SESSIONS_JS.index("\n}\n", start)]
++    assert "refreshSessionList('new-session',{force:true})" in body
