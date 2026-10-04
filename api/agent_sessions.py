@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from contextlib import closing, nullcontext
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, quote_from_bytes
@@ -71,30 +72,36 @@ def state_db_readonly_uri(db_path, platform: str | None = None) -> str:
     return state_db_file_uri(db_path, platform=platform) + "?mode=ro"
 
 
+def _install_read_deadline(conn: sqlite3.Connection, deadline_s: float) -> None:
+    """Abort a statement that outruns its wall-clock budget."""
+    deadline = time.monotonic() + max(0.0, float(deadline_s))
+
+    def _expired() -> int:
+        return 1 if time.monotonic() > deadline else 0
+
+    conn.set_progress_handler(_expired, 1000)
+
+
 def open_state_db_readonly(
     db_path: Path,
     log: logging.Logger | None = None,
     *,
     strict: bool = False,
+    timeout: float | None = None,
+    deadline_s: float | None = None,
 ) -> sqlite3.Connection:
-    """Open the live agent ``state.db`` read-only for a pure-read projection.
-
-    ``strict`` is retained for compatibility with callers that explicitly mark
-    foreign-profile reads; all opens are now strict read-only regardless.
-
-    Same rationale as the session-listing path (#5455): a write-capable handle
-    on the multi-GB, WAL ``state.db`` while the agent streams into it adds
-    needless checkpoint/lock surface. The read-only ``file:...?mode=ro`` URI
-    avoids that. Read failures propagate; a reader never upgrades to a writer.
-
-    The caller must ensure ``db_path`` exists — this raises ``FileNotFoundError``
-    for a missing path rather than creating a ghost database.
-
-    Callers own the returned connection (wrap it in ``contextlib.closing``).
-    """
+    """Open the live agent ``state.db`` read-only for a pure-read projection."""
     if not db_path.exists():
         raise FileNotFoundError(f"agent state.db not found: {db_path}")
-    return sqlite3.connect(state_db_readonly_uri(db_path.resolve()), uri=True)
+    uri = state_db_readonly_uri(db_path.resolve())
+    conn = (
+        sqlite3.connect(uri, uri=True, timeout=timeout)
+        if timeout is not None
+        else sqlite3.connect(uri, uri=True)
+    )
+    if deadline_s is not None:
+        _install_read_deadline(conn, deadline_s)
+    return conn
 
 
 MESSAGING_SOURCES = {

@@ -465,3 +465,78 @@ def test_visible_tab_message_load_still_syncs_viewed_count():
         "an actively-viewed session must still sync its viewed count to the "
         "loaded message count"
     )
+
+
+# -- Functional: a delayed cron retry must not restore a cleared dot (#7830) --
+
+def test_visit_then_leave_then_retry_does_not_restore_unread_dot():
+    """#7830: a cron detail retry that resolves after the user opened and left the
+    session must NOT restore the completion-unread dot they already cleared.
+    """
+    ack = _extract("_acknowledgeSessionVisit")
+    sync = _extract("_syncSessionListSnapshotOnVisit")
+    set_viewed = _extract("_setSessionViewedCount")
+    clear_unread = _extract("_clearSessionCompletionUnread")
+    get_unread = _extract("_getSessionCompletionUnread")
+    save_unread = _extract("_saveSessionCompletionUnread")
+    get_counts = _extract("_getSessionViewedCounts")
+    save_counts = _extract("_saveSessionViewedCounts")
+    mark_unread = _extract("_markSessionCompletionUnread")
+    actively_viewed = _extract("_isSessionActivelyViewedForList")
+    background = _extract("_markSessionCompletionUnreadIfBackground")
+
+    script = f"""
+const _store = {{}};
+const localStorage = {{
+  getItem: (k) => (k in _store ? _store[k] : null),
+  setItem: (k, v) => {{ _store[k] = String(v); }},
+  removeItem: (k) => {{ delete _store[k]; }},
+  key: (i) => Object.keys(_store)[i] ?? null,
+  get length() {{ return Object.keys(_store).length; }},
+}};
+const SESSION_VIEWED_COUNTS_KEY = 'v';
+const SESSION_COMPLETION_UNREAD_KEY = 'u';
+let _sessionViewedCounts = null;
+let _sessionCompletionUnread = null;
+const _sessionListSnapshotById = new Map();
+const _sessionStreamingById = new Map();
+const _allSessions = [];
+let _loadingSessionId = null;
+let repaints = 0;
+function renderSessionListFromCache() {{ repaints += 1; }}
+function _forgetObservedStreamingSession() {{}}
+let S = {{ session: {{ session_id: 'other', message_count: 1 }} }};
+const document = {{ visibilityState: 'visible', hasFocus: () => true }};
+{get_counts}
+{save_counts}
+{get_unread}
+{save_unread}
+{clear_unread}
+{mark_unread}
+{set_viewed}
+{sync}
+{ack}
+{actively_viewed}
+{background}
+{unread_store_helpers.BLOCK}
+function _hasDot(sid) {{
+  return Object.prototype.hasOwnProperty.call(_getSessionCompletionUnread(), sid);
+}}
+const firstMark = _markSessionCompletionUnreadIfBackground('cron_a_20', 2, {{source:'cron', profile:'default'}});
+const afterCompletion = _hasDot('cron_a_20');
+S = {{ session: {{ session_id: 'cron_a_20', message_count: 2 }} }};
+_acknowledgeSessionVisit('cron_a_20', 2, 10);
+const afterVisit = _hasDot('cron_a_20');
+S = {{ session: {{ session_id: 'other', message_count: 1 }} }};
+const retryMark = _markSessionCompletionUnreadIfBackground('cron_a_20', 2, {{source:'cron', profile:'default'}});
+const afterRetry = _hasDot('cron_a_20');
+const newerMark = _markSessionCompletionUnreadIfBackground('cron_a_20', 3, {{source:'cron', profile:'default'}});
+const afterNewer = _hasDot('cron_a_20');
+console.log(JSON.stringify({{firstMark, afterCompletion, afterVisit, retryMark, afterRetry, newerMark, afterNewer}}));
+"""
+    out = _run_node(script)
+    assert out["firstMark"] is True and out["afterCompletion"] is True
+    assert out["afterVisit"] is False
+    assert out["retryMark"] is False
+    assert out["afterRetry"] is False
+    assert out["newerMark"] is True and out["afterNewer"] is True

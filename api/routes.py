@@ -326,7 +326,7 @@ def _normalize_cron_job_ids(job_ids) -> list[str]:
 
 
 def _latest_cron_session_info_for_jobs(
-    job_ids, completed_job_ids=None
+    job_ids, completed_job_ids=None, deadline_s: float | None = None
 ) -> dict[str, dict[str, int | str | None]]:
     """Return newest persisted cron session info keyed by completed cron job id."""
     normalized = _normalize_cron_job_ids(job_ids)
@@ -334,6 +334,164 @@ def _latest_cron_session_info_for_jobs(
     if not requested:
         return {}
     if not normalized:
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    db_path = _active_state_db_path()
+    if not db_path or not Path(db_path).exists():
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    bounds = []
+    for jid in requested:
+        lo = f"cron_{jid}_"
+        bounds.append((lo, lo + chr(0x10FFFF)))
+    id_clause = (
+        "(" + " OR ".join("(s.id >= ? AND s.id < ?)" for _ in bounds) + ")"
+    )
+    id_params = [v for lo, hi in bounds for v in (lo, hi)]
+    try:
+        if deadline_s is None:
+            conn = open_state_db_readonly(db_path)
+        else:
+            conn = open_state_db_readonly(
+                db_path, timeout=deadline_s, deadline_s=deadline_s
+            )
+        with closing(conn):
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in cur.fetchall()}
+            if "id" not in session_cols or "source" not in session_cols:
+                return {jid: {"session_id": "", "message_count": None} for jid in requested}
+            select_message_count = (
+                "s.message_count AS message_count"
+                if "message_count" in session_cols
+                else "NULL AS message_count"
+            )
+            if "started_at" in session_cols:
+                query = f"""
+                    SELECT s.id,
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
+                    ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC
+                """
+            else:
+                query = f"""
+                    SELECT s.id,
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
+                    ORDER BY s.id DESC
+                """
+            cur.execute(query, id_params)
+            results = {
+                jid: {"session_id": "", "message_count": None} for jid in requested
+            }
+            requested_ids = set(requested)
+            prefixes = {jid: f"cron_{jid}_" for jid in normalized}
+            for row in cur.fetchall():
+                sid = str(row["id"] or "")
+                if not sid:
+                    continue
+                matches = [
+                    jid
+                    for jid in normalized
+                    if sid.startswith(prefixes[jid])
+                ]
+                if matches:
+                    jid = max(matches, key=len)
+                    if jid not in requested_ids or results[jid]["session_id"]:
+                        continue
+                    results[jid] = {
+                        "session_id": sid,
+                        "message_count": (
+                            int(row["message_count"])
+                            if row["message_count"] is not None
+                            else None
+                        ),
+                    }
+                if all(info["session_id"] for info in results.values()):
+                    break
+            return results
+    except sqlite3.Error:
+        if deadline_s is not None:
+            raise
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    db_path = _active_state_db_path()
+    if not db_path or not Path(db_path).exists():
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    bounds = []
+    for jid in requested:
+        lo = f"cron_{jid}_"
+        bounds.append((lo, lo + chr(0x10FFFF)))
+    id_clause = (
+        "(" + " OR ".join("(s.id >= ? AND s.id < ?)" for _ in bounds) + ")"
+    )
+    id_params = [v for lo, hi in bounds for v in (lo, hi)]
+    try:
+        if deadline_s is None:
+            conn = open_state_db_readonly(db_path)
+        else:
+            conn = open_state_db_readonly(
+                db_path, timeout=deadline_s, deadline_s=deadline_s
+            )
+        with closing(conn):
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {row["name"] for row in cur.fetchall()}
+            select_started = "s.started_at," if "started_at" in cols else ""
+            select_message_count = "s.message_count" if "message_count" in cols else "NULL as message_count"
+            if "started_at" in cols:
+                query = f"""
+                    SELECT s.id,
+                           {select_started}
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
+                    ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC
+                """
+            else:
+                query = f"""
+                    SELECT s.id,
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
+                    ORDER BY s.id DESC
+                """
+            cur.execute(query, id_params)
+            results = {
+                jid: {"session_id": "", "message_count": None} for jid in requested
+            }
+            unmatched = set(requested)
+            for row in cur.fetchall():
+                sid = str(row["id"] or "").strip()
+                count = row["message_count"]
+                if count is not None:
+                    try:
+                        count = max(0, int(count))
+                    except (ValueError, TypeError):
+                        count = None
+                parsed_job_id = None
+                for jid in requested:
+                    prefix = f"cron_{jid}_"
+                    if sid.startswith(prefix):
+                        parsed_job_id = jid
+                        break
+                if parsed_job_id and parsed_job_id in unmatched:
+                    results[parsed_job_id] = {
+                        "session_id": sid,
+                        "message_count": count,
+                    }
+                    unmatched.remove(parsed_job_id)
+                if not unmatched:
+                    break
+            return results
+    except sqlite3.Error:
+        if deadline_s is not None:
+            raise
         return {jid: {"session_id": "", "message_count": None} for jid in requested}
     db_path = _active_state_db_path()
     if not db_path or not Path(db_path).exists():
@@ -24440,18 +24598,34 @@ def _handle_cron_recent(handler, parsed):
                         "badge_notifications": job.get("badge_notifications") is not False,
                     }
                 )
-        latest_session_info = _latest_cron_session_info_for_jobs(
-            [job.get("id", "") for job in jobs],
-            [c["job_id"] for c in completions],
-        )
+        session_lookup_failed = False
+        try:
+            latest_session_info = _latest_cron_session_info_for_jobs(
+                [job.get("id", "") for job in jobs],
+                [c["job_id"] for c in completions],
+                deadline_s=0.25,
+            )
+        except Exception:
+            latest_session_info = {}
+            session_lookup_failed = True
         for completion in completions:
             info = latest_session_info.get(str(completion.get("job_id", "") or ""), {})
             completion["session_id"] = str(info.get("session_id", "") or "")
             if info.get("message_count") is not None:
                 completion["message_count"] = int(info["message_count"])
-        return j(handler, {"completions": completions, "since": since})
+        return j(
+            handler,
+            {
+                "completions": completions,
+                "since": since,
+                "session_lookup_failed": session_lookup_failed,
+            },
+        )
     except ImportError:
-        return j(handler, {"completions": [], "since": since})
+        return j(
+            handler,
+            {"completions": [], "since": since, "session_lookup_failed": False},
+        )
 
 
 _PROJECT_CONTEXT_HERMES_NAMES = (".hermes.md", "HERMES.md")
