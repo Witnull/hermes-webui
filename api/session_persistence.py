@@ -23,11 +23,80 @@ class _Lifetime:
         self.revoked = revoked
 
 
+class _GateLock:
+    """Read-write lock: multiple writers can persist in parallel, deletion is exclusive."""
+
+    def __init__(self):
+        self._mutex = threading.Lock()
+        self._cond = threading.Condition(self._mutex)
+        self._writer_active = False
+        self._writer_thread = None
+        self._writer_depth = 0
+        self._active_readers = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        import time
+        ident = threading.get_ident()
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        with self._mutex:
+            if self._writer_active and self._writer_thread == ident:
+                self._writer_depth += 1
+                return True
+            while self._writer_active or self._active_readers > 0:
+                if not blocking:
+                    return False
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cond.wait(timeout=remaining)
+                else:
+                    self._cond.wait()
+            self._writer_active = True
+            self._writer_thread = ident
+            self._writer_depth = 1
+            return True
+
+    def release(self):
+        with self._mutex:
+            if not self._writer_active or self._writer_thread != threading.get_ident():
+                raise RuntimeError("Cannot release unheld gate lock")
+            self._writer_depth -= 1
+            if self._writer_depth == 0:
+                self._writer_active = False
+                self._writer_thread = None
+                self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+    @contextmanager
+    def shared(self):
+        ident = threading.get_ident()
+        with self._mutex:
+            while self._writer_active:
+                if self._writer_thread == ident:
+                    break
+                self._cond.wait()
+            self._active_readers += 1
+        try:
+            yield
+        finally:
+            with self._mutex:
+                self._active_readers -= 1
+                if self._active_readers == 0:
+                    self._cond.notify_all()
+
+
 class _Gate:
     def __init__(self, root, sid):
         self.root = root
         self.sid = sid
-        self.lock = threading.RLock()
+        self.lock = _GateLock()
         self.current = _Lifetime(_deleted_on_disk(root, sid))
 
 
@@ -89,7 +158,7 @@ class SessionPersistenceHandle:
 
     @contextmanager
     def writing(self):
-        with self.gate.lock:
+        with self.gate.lock.shared():
             if not self.valid:
                 raise SessionPersistenceRevoked(
                     f"Session {self.gate.sid!r} persistence authority was revoked"
