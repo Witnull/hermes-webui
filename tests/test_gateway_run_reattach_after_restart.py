@@ -634,7 +634,7 @@ def test_reattach_streams_from_the_journal_cursor_and_keeps_reasoning_and_tools(
     assert [r for r in relayed if r[1] is not None and r[1] >= 4] == [
         ("reasoning", 4), ("tool", 5), ("tool_complete", 6), ("token", 7),
     ]
-    assert [e for e in relayed if e[0] in {"done", "stream_end"}] == [("done", None), ("stream_end", None)]
+    assert relayed[-2:] == [("done", None), ("stream_end", None)]
     saved = _saved(sid)
     final = saved["messages"][-1]
     assert final["content"] == "Before after."

@@ -75,19 +75,31 @@ def _wait_until(page, expression, timeout_ms):
 
 
 def _start_fresh_chat(page, trigger):
+    """Start a fresh chat via ``trigger``; return failure lines for the driver itself."""
     if trigger == "button":
         page.click("#btnNewChat")
     elif trigger == "slash":
+        # The first slash command after page load starts the skill, bundle and agent
+        # metadata loaders; each one re-opens the autocomplete when it lands, which can
+        # swallow the second Enter. Warm them first so the typed sequence is
+        # deterministic (the race is in this driver, not in /new).
+        page.evaluate(
+            "() => Promise.all([loadSkillCommands(), loadBundleCommands(),"
+            " loadAgentCommandMetadata()])"
+        )
         # As typed: the first Enter takes the open autocomplete, the second sends.
         page.click("#msg")
         page.keyboard.type("/new")
-        _wait_until(page, "!!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS)
+        if not _wait_until(page, "!!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
+            return ["  [slash] the /new autocomplete never opened"]
         page.keyboard.press("Enter")
-        _wait_until(page, "!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS)
+        if not _wait_until(page, "!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
+            return ["  [slash] the autocomplete did not close after taking /new"]
         page.keyboard.press("Enter")
     else:
         page.evaluate("document.activeElement && document.activeElement.blur()")
         page.keyboard.press("Meta+k" if sys.platform == "darwin" else "Control+k")
+    return []
 
 
 def _done(trigger):
@@ -126,8 +138,10 @@ def _check(browser, trigger):
     page.route("**/api/sessions*", lambda route: held.append(route)
                if _is_session_list(route.request.url) else route.continue_())
 
-    _start_fresh_chat(page, trigger)
-    if not _wait_until(page, _done(trigger), FOCUS_TIMEOUT_MS):
+    driver_failures = _start_fresh_chat(page, trigger)
+    if driver_failures:
+        failures.extend(driver_failures)
+    elif not _wait_until(page, _done(trigger), FOCUS_TIMEOUT_MS):
         failures.append(
             f"  [{trigger}] not finished (composer focused"
             f"{', toast shown' if trigger == 'slash' else ''}) within {FOCUS_TIMEOUT_MS} ms "
