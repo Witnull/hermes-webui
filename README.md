@@ -304,6 +304,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Arrow keys navigate, Tab/Enter select, Escape closes
 - `/refine [focus]` runs the memory/skill review fork in the background, like the Hermes CLI — any memory/skill updates are reported in the chat when done
 - `/review [focus]` spawns the independent reviewer subagent in the background, like the Hermes CLI — its report returns to the chat when done
+- `/loop [interval] <prompt> [--times N] [--until <condition>]` re-runs a prompt in the current chat, like the Hermes CLI (`status` / `pause` / `resume` / `stop` to control it; these also work while a loop run is in progress). A server thread starts each run, so loops keep going with the tab closed. A loop ends when the agent replies `LOOP_COMPLETE`, or when `--times`/`--until` is met; it pauses after `loops.max_ticks` runs (default 100) or when you press Stop on a loop run. State lives in the chat's profile `state.db`, shared with the CLI. Looping a slash command isn't supported
 - Unrecognized commands pass through to the agent
 
 #### Model aliases in `/model`

@@ -1,5 +1,5 @@
 const _WEBUI_DISPATCHABLE_AGENT_COMMANDS = new Set([
-  'reload-mcp','reload-skills','codex-runtime','credits','refine','review',
+  'reload-mcp','reload-skills','codex-runtime','credits','refine','review','loop',
   'moa','sessions','resume','pet'
 ]);
 // ── Slash commands ──────────────────────────────────────────────────────────

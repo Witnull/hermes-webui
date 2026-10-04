@@ -1080,7 +1080,8 @@ def test_busy_stop_executes_real_cancel_branch():
         const r2 = await busyIntercept('/agents', false);
         const r3 = await busyIntercept('/refine', false);
         const r4 = await busyIntercept('/review', false);
-        return { stop: r1, agents: r2, refine: r3, review: r4 };
+        const r5 = await busyIntercept('/loop pause', false);
+        return { stop: r1, agents: r2, refine: r3, review: r4, loop: r5 };
         """
     )
     # /stop is intercepted by the busy branch (cmdStop -> cancelStream ran,
@@ -1093,6 +1094,8 @@ def test_busy_stop_executes_real_cancel_branch():
     assert out["result"]["agents"] == {"intercepted": False}
     assert out["result"]["refine"] == {"intercepted": True}
     assert out["result"]["review"] == {"intercepted": True}
+    assert out["result"]["loop"] == {"intercepted": True}
+    assert 'api:/api/commands/exec {"command":"/loop pause","session_id":"sess-1"}' in out["calls"], out["calls"]
     assert any(c.startswith("cancelStream:slash-stop") for c in out["calls"]), out["calls"]
     assert any(
         c == 'api:/api/commands/exec {"command":"/refine","session_id":"sess-1"}'
