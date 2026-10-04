@@ -29,9 +29,16 @@
     Bind address. Overrides HERMES_WEBUI_HOST env.
     Default: 127.0.0.1.
 
+.PARAMETER Restart
+    Stop any existing instance running on the target port before starting.
+
 .EXAMPLE
     .\start.ps1
     # Bind to 127.0.0.1:8787, foreground.
+
+.EXAMPLE
+    .\start.ps1 -Restart
+    # Stop existing instance and restart on 127.0.0.1:8787.
 
 .EXAMPLE
     .\start.ps1 -Port 9000
@@ -49,7 +56,8 @@
 [CmdletBinding()]
 param(
     [int]$Port = 0,
-    [string]$BindHost = ''
+    [string]$BindHost = '',
+    [switch]$Restart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -194,6 +202,14 @@ if (-not $env:HERMES_WEBUI_STATE_DIR) {
 New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
 New-Item -ItemType Directory -Force -Path $env:HERMES_WEBUI_STATE_DIR | Out-Null
 
+# === Handle -Restart ==================================================
+if ($Restart) {
+    $stopScript = Join-Path $RepoRoot 'stop.ps1'
+    if (Test-Path $stopScript) {
+        & $stopScript -Port $PortFinal
+    }
+}
+
 # === Launch (foreground, matches start.sh) =============================
 Write-Host "[start.ps1] Hermes WebUI native Windows launcher" -ForegroundColor Cyan
 Write-Host "[start.ps1] Python:     $Python"
@@ -208,23 +224,17 @@ if (-not (Test-Path $serverPath)) {
     exit 1
 }
 
-# Capture exit code, let finally{} run Pop-Location, exit AFTER the try.
-# Plain `exit $LASTEXITCODE` inside the try block can prevent the finally
-# from running in some termination paths (especially when dot-sourced or
-# in interactive sessions), leaving the caller's working directory stuck
-# at $RepoRoot.
 $script:serverExitCode = 0
+$pidFile = Join-Path $env:HERMES_HOME 'webui.pid'
 Push-Location $RepoRoot
 try {
-    # @args was non-functional here — PowerShell does NOT populate $args when the
-    # script declares [CmdletBinding()] with an explicit param() block (Copilot's
-    # finding on PR #2807). Dropped rather than added a ValueFromRemainingArguments
-    # parameter, because the existing tracked use case is the launcher running
-    # server.py with the env-var-driven config — no pass-through args are needed.
-    # If pass-through becomes a requirement later, add a [Parameter(ValueFromRemainingArguments=$true)] [string[]]$ServerArgs and splat that.
+    Set-Content -Path $pidFile -Value $PID -Encoding UTF8 -ErrorAction SilentlyContinue
     & $Python $serverPath
     $script:serverExitCode = $LASTEXITCODE
 } finally {
+    if (Test-Path $pidFile) {
+        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    }
     Pop-Location
 }
 exit $script:serverExitCode
