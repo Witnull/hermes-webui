@@ -46,6 +46,13 @@ contributor guidance; it does not change runtime behavior or CI gates.
   work under #3926. Use it to distinguish shipped wiring from historical slice
   boundaries before changing live SSE, replay, settlement, `INFLIGHT`, or
   `renderMessages()` paths.
+- [`docs/architecture/transcript-auto-follow-scroll.md`](architecture/transcript-auto-follow-scroll.md):
+  implemented contract for transcript auto-follow: the pinned/unpinned state
+  model, the input-tail capture and reader-resume re-pinning rules (including
+  one-consumption-per-input and reader input outranking queued restores), and
+  the `overscroll-behavior-y: none` rationale for `.messages`. Start here
+  before changing the scroll listener, the settle writer, or the queued
+  live-render restore paths.
 - [`docs/rfcs/canonical-session-resolution.md`](rfcs/canonical-session-resolution.md):
   proposed contract for resolving URL routes, query parameters, localStorage,
   sidebar rows, and compression-lineage IDs to one canonical visible session
@@ -118,6 +125,14 @@ contributor guidance; it does not change runtime behavior or CI gates.
   retarget or transient resolve fallback is always observed on the next call.
   Start here before widening this cache's scope or adding a similar
   call-scoped cache elsewhere (#7636).
+- [`docs/architecture/session-channel-lifecycle.md`](architecture/session-channel-lifecycle.md):
+  current contract for the per-session SSE channel and the per-turn stream lifecycle: the state
+  layers and their authoritative writers, the writer-side subscriber-liveness signal plus the
+  channel collection rules (`GRACE`, `IDLE_TTL`, queue-stall and writer-staleness), the single
+  orphan predicate shared by `chat/start` admission, busy reporting and the reaper, the
+  launch-phase claim that covers registration-to-admission, and the lock discipline
+  (`STREAMS_LOCK → ACTIVE_RUNS_LOCK`). Start here before changing subscriber liveness, channel
+  collection, stream registration, or orphan reclaim (#7302).
 
 When a change touches streaming, recovery, replay, compression, context
 reconstruction, cancellation, approval/clarify, session metadata, or run state,

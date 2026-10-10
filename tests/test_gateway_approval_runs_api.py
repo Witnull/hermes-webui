@@ -1024,7 +1024,7 @@ def test_empty_id_runs_approval_reaches_real_response_lifecycle():
 
         events_connects = 0
 
-        def fake_urlopen(req, *, timeout=None):
+        def fake_urlopen(req, *, timeout=None, choice=choice):
             nonlocal events_connects
             if req.full_url.endswith("/v1/runs"):
                 return _JsonResponse()
@@ -1671,16 +1671,10 @@ def test_retire_gateway_pending_mirror_notifies_reconciled_successor_when_target
 
 
 def test_local_stop_uses_runs_api_stop_endpoint():
-    from api.gateway_chat import (
-        _clear_gateway_run_starting,
-        _mark_gateway_run_starting,
-        _publish_gateway_run_id,
-        stop_gateway_run,
-    )
+    from api.gateway_chat import _STREAM_RUN_IDS, stop_gateway_run
 
     stream_id = "stream-stop"
-    _mark_gateway_run_starting(stream_id, profile="default")
-    _publish_gateway_run_id(stream_id, "run-stop")
+    _STREAM_RUN_IDS[stream_id] = "run-stop"
 
     class _Response:
         status = 200
@@ -1711,7 +1705,7 @@ def test_local_stop_uses_runs_api_stop_endpoint():
              patch("api.gateway_chat._gateway_api_key", return_value="secret"):
             assert stop_gateway_run("run-stop") is True
     finally:
-        _clear_gateway_run_starting(stream_id)
+        _STREAM_RUN_IDS.pop(stream_id, None)
 
     request, timeout = requests[0]
     assert request.full_url == "http://gw:8642/v1/runs/run-stop/stop"
@@ -2337,7 +2331,7 @@ def test_gateway_worker_prelude_exception_retires_failed_start_after_waiter_cons
         assert int((lifecycle.get(stream_id) or {}).get("waiters") or 0) == 1
         with patch("api.gateway_chat.RunJournalWriter", return_value=SimpleNamespace(append_sse_event=lambda *_a, **_k: None)), \
              patch("api.gateway_chat.get_session", return_value=session), \
-             patch("api.config.get_config_for_profile_home", side_effect=RuntimeError("prelude boom")):
+             patch("api.config.get_config", side_effect=RuntimeError("prelude boom")):
             worker_thread.start()
             worker_thread.join(timeout=5)
             assert not worker_thread.is_alive()
@@ -3236,8 +3230,7 @@ def test_gateway_approval_response_relay():
     # Seed the mapping.
     _STREAM_RUN_IDS["sid-relay"] = "run abc/1"
     approvals.submit_gateway_pending_mirror("sess-relay", {
-        "run_id": "run abc/1", "approval_id": "appr x/y", "command": "echo x",
-        "_gateway_profile": "default",
+        "run_id": "run abc/1", "approval_id": "appr x/y", "command": "echo x"
     })
 
     mock_session = MagicMock()
@@ -3454,49 +3447,6 @@ def test_gateway_approval_response_invalid_gateway_base_returns_502():
 
     _STREAM_RUN_IDS.pop("sid-relay-invalid-base", None)
     approvals._pending.pop("sess-relay", None)
-
-
-def test_gateway_approval_relay_survives_lost_session_sidecar():
-    """F1: a lost/evicted session sidecar must not crash the relay.
-
-    Pre-fix ``_relay_gateway_run_approval`` called ``get_session(sid)``
-    unguarded, so a missing session turned a valid mirrored approval into an
-    unhandled ``KeyError`` instead of relaying the choice. A lost session must
-    fall back to the mirror's immutable run binding and still relay.
-    """
-    from api.gateway_chat import _STREAM_RUN_IDS
-    from api.routes import _relay_gateway_run_approval
-    import api.route_approvals as approvals
-
-    sid = "sess-relay-lost-session"
-    stream_id = "sid-relay-lost-session"
-    _STREAM_RUN_IDS[stream_id] = "run-lost"
-    approvals._pending.pop(sid, None)
-    approvals._gateway_queues.pop(sid, None)
-    approvals.submit_gateway_pending_mirror(
-        sid, {"run_id": "run-lost", "approval_id": "appr-lost", "command": "echo x"}
-    )
-
-    def _missing_session(_sid):
-        raise KeyError(_sid)
-
-    try:
-        with patch("api.routes.get_session", side_effect=_missing_session), \
-             patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
-             patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
-             patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
-            payload, status = _relay_gateway_run_approval(
-                sid, {"run_id": "run-lost", "approval_id": "appr-lost"}, "once",
-                enable_yolo=False,
-            )
-
-        assert status == 200, payload
-        respond.assert_called_once_with("run-lost", "", "once")
-    finally:
-        _STREAM_RUN_IDS.pop(stream_id, None)
-        approvals._pending.pop(sid, None)
-        approvals._gateway_queues.pop(sid, None)
 
 
 def test_identityless_gateway_relay_duplicate_response_is_single_flight():

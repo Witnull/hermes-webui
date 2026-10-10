@@ -68,8 +68,13 @@ def test_inline_think_still_split_from_content():
     assert s.messages[1]['reasoning'] == 'plan'
 
 
-def _run_turn(script, final_messages):
-    """Drive _run_agent_streaming with a fake agent; return the messages last saved."""
+def _run_turn(script, final_messages, legacy=False):
+    """Drive _run_agent_streaming with a fake agent; return the messages last saved.
+
+    ``legacy=True`` uses an Agent whose constructor predates ``tool_start_callback`` /
+    ``tool_complete_callback`` (Agent builds before 2026-04), so the WebUI falls back to
+    positional settlement.
+    """
     import api.streaming as streaming
 
     saved_snapshots = []
@@ -132,8 +137,11 @@ def _run_turn(script, final_messages):
                 elif kind == 'tool':
                     # tool_executor order: progress 'tool.started', then tool_start_callback.
                     self.cb['progress']('tool.started', 'terminal', 'ls', {})
-                    self.cb['start'](value, 'terminal', {})
-                    self.cb['complete'](value, 'terminal', {}, 'ok')
+                    if self.cb['start'] is not None:
+                        self.cb['start'](value, 'terminal', {})
+                        self.cb['complete'](value, 'terminal', {}, 'ok')
+                    else:  # legacy Agent: only progress events, no start/complete callbacks
+                        self.cb['progress']('tool.completed', 'terminal', 'ls', {})
                 elif kind == 'interim':  # agent/stream_delivery.py:_deliver_interim
                     self.cb['interim'](value, already_streamed=False)
                 elif kind == 'token':
@@ -145,6 +153,19 @@ def _run_turn(script, final_messages):
         def interrupt(self, _message):
             pass
 
+    class LegacyScriptedAgent(ScriptedAgent):
+        # Constructor without tool_start_callback / tool_complete_callback, like Agent
+        # builds before the callback was added; the WebUI inspects this signature.
+        def __init__(self, model=None, provider=None, base_url=None, platform=None, quiet_mode=False,
+                     enabled_toolsets=None, fallback_model=None, session_id=None, session_db=None,
+                     prefill_messages=None, stream_delta_callback=None, reasoning_callback=None,
+                     tool_progress_callback=None, clarify_callback=None, interim_assistant_callback=None,
+                     **_kwargs):
+            super().__init__(stream_delta_callback=stream_delta_callback, reasoning_callback=reasoning_callback,
+                             tool_progress_callback=tool_progress_callback,
+                             interim_assistant_callback=interim_assistant_callback)
+
+    agent_cls = LegacyScriptedAgent if legacy else ScriptedAgent
     fake_session = FakeSession()
     stream_id = f'stream_settle_reasoning_{run_id}'
     fake_session.active_stream_id = stream_id
@@ -163,7 +184,7 @@ def _run_turn(script, final_messages):
     sys.modules.update(injected)
     try:
         with mock.patch.object(streaming, 'get_session', return_value=fake_session), \
-             mock.patch.object(streaming, '_get_ai_agent', return_value=ScriptedAgent), \
+             mock.patch.object(streaming, '_get_ai_agent', return_value=agent_cls), \
              mock.patch.object(streaming, 'resolve_model_provider', return_value=('gpt-test', 'openai', None)), \
              mock.patch('api.config.get_config', return_value={}), \
              mock.patch('api.config._resolve_cli_toolsets', return_value=[]):
@@ -378,3 +399,93 @@ def test_explicit_id_out_of_start_order_leaves_idless_steps_unbound(cleanup_test
          {'role': 'assistant', 'content': 'done', 'reasoning': None}],
     )
     assert _reasonings(saved) == [None, 'think A', None]
+
+
+def _codex_commentary_step(call_id, text, reasoning):
+    # agent/codex_responses_adapter.py: commentary lives in codex_message_items, content is ''
+    step = _tool_step(call_id, reasoning)
+    step['codex_message_items'] = [{'type': 'message', 'role': 'assistant', 'phase': 'commentary',
+                                    'content': [{'type': 'output_text', 'text': text}]}]
+    return step
+
+
+_CODEX_SCRIPT = [('reasoning', 'think A'), ('interim', 'Running the test suite.'), ('tool', 'c1')]
+
+
+def test_codex_commentary_final_repeats_commentary_with_agent_reasoning(cleanup_test_sessions):
+    saved = _run_turn(
+        _CODEX_SCRIPT + [('reasoning', 'final'), ('token', 'Running the test suite. All green.')],
+        [_codex_commentary_step('c1', 'Running the test suite.', 'think A'), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'Running the test suite. All green.', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'final']
+
+
+def test_codex_commentary_final_repeats_commentary_without_thinking(cleanup_test_sessions):
+    saved = _run_turn(
+        _CODEX_SCRIPT + [('token', 'Running the test suite. All green.')],
+        [_codex_commentary_step('c1', 'Running the test suite.', 'think A'), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'Running the test suite. All green.', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', None]
+
+
+def test_codex_commentary_step_without_agent_reasoning_keeps_stream_segment(cleanup_test_sessions):
+    saved = _run_turn(
+        _CODEX_SCRIPT + [('reasoning', 'final'), ('token', 'Running the test suite. All green.')],
+        [_codex_commentary_step('c1', 'Running the test suite.', None), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'Running the test suite. All green.', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'final']
+
+
+def test_codex_commentary_final_does_not_repeat_commentary(cleanup_test_sessions):
+    saved = _run_turn(
+        _CODEX_SCRIPT + [('reasoning', 'final'), ('token', 'All green.')],
+        [_codex_commentary_step('c1', 'Running the test suite.', 'think A'), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'All green.', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'final']
+
+
+# Agent builds that predate tool_start_callback (before 2026-04) get positional settlement:
+# the final step's open segment must not override the positional mapping, or a silent
+# final step inherits the previous step's thinking (release gate #7788).
+_FINAL_SILENT = {'role': 'assistant', 'content': 'done', 'reasoning': None}
+
+
+def test_legacy_agent_final_silent_does_not_inherit_tool_step_thinking(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('token', 'done')],
+        [_tool_step('c1', None), _tool_result('c1'), dict(_FINAL_SILENT)],
+        legacy=True,
+    )
+    assert _reasonings(saved) == ['think A', None]
+
+
+def test_legacy_agent_final_with_own_thinking_keeps_it(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('reasoning', 'final'), ('token', 'done')],
+        [_tool_step('c1', None), _tool_result('c1'), dict(_FINAL_SILENT)],
+        legacy=True,
+    )
+    assert _reasonings(saved) == ['think A', 'final']
+
+
+def test_legacy_agent_two_silent_steps_after_thinking(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('tool', 'c2'), ('token', 'done')],
+        [_tool_step('c1', None), _tool_result('c1'), _tool_step('c2', None), _tool_result('c2'),
+         dict(_FINAL_SILENT)],
+        legacy=True,
+    )
+    assert _reasonings(saved) == ['think A', None, None]
+
+
+def test_legacy_agent_interim_step_then_silent_final(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('interim', 'Checking.'), ('tool', 'c1'), ('token', 'done')],
+        [dict(_tool_step('c1', None), content='Checking.'), _tool_result('c1'), dict(_FINAL_SILENT)],
+        legacy=True,
+    )
+    assert _reasonings(saved) == ['think A', None]

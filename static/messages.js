@@ -5,7 +5,7 @@ const _AGENT_COMMAND_ALIASES = {
   'credits': 'credits'
 };
 const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set([
-  'reload-mcp','reload-skills','codex-runtime','credits','refine','review','loop',
+  'reload-mcp','reload-skills','codex-runtime','credits',
   'reload_mcp','reload_skills','codex_runtime','credits'
 ]);
 function _markSessionViewed(sid, messageCount) {
@@ -31,62 +31,6 @@ function _apiUrl(path) {
 const _BG_TASK_COMPLETE_TTL_MS = 60000;
 const _BG_TASK_COMPLETE_CAP = 256;
 const _bgTaskCompleteSeenIds = new Map();
-
-// #7855 (round 5): the continuation ID is a per-invocation parameter of
-// send(), NOT a shared module slot.
-//
-// Round 4 used one module-level string that the drain wrote and send() read.
-// Any other send() that was mid-`await` (e.g. a genuine user turn waiting on
-// its upload) read the value the drain had just published and posted it — so
-// the wrong turn consumed the goal. A slot cannot express "this ID belongs to
-// THIS send"; a parameter can. The drain passes it in, send() snapshots it
-// synchronously before its first `await`, and it dies with the call frame.
-function _normalizeGoalContinuationId(id){return String(id||'').trim();}
-
-// #7855 (round 5): a continuation restored into the composer after a refresh
-// is an IDENTIFIABLE DRAFT, not a global. The ID lives on the composer element
-// together with the exact text it was restored for; it is handed to a send only
-// while that text is still what is being sent, and is dropped the moment the
-// user replaces or abandons it. A global slot could not express that condition,
-// which is how a refreshed continuation used to end up on a user-authored turn.
-function _takeRestoredDraftGoalContinuationId(text){
-  try{
-    const _msg=(typeof $==='function')?$('msg'):null;
-    if(!_msg) return '';
-    const _draftId=_normalizeGoalContinuationId(_msg.dataset&&_msg.dataset.goalContinuationId);
-    const _draftText=String((_msg.dataset&&_msg.dataset.goalContinuationText)||'');
-    // Always clear: the draft is one-shot, and an abandoned/replaced draft must
-    // not leave a live token behind for a later unrelated send.
-    if(_msg.dataset){delete _msg.dataset.goalContinuationId;delete _msg.dataset.goalContinuationText;}
-    if(!_draftId) return '';
-    // The user replaced the restored text → this is their message, not the
-    // continuation. Fail closed: no token.
-    if(!text||String(text).trim()!==_draftText) return '';
-    return _draftId;
-  }catch(_){ return ''; }
-}
-
-// #7855: the writer side of the restored-continuation draft. Module scope for
-// the same reason the ID itself had to be: the restore path (static/sessions.js)
-// and send() are sibling top-level scopes.
-function _setRestoredGoalContinuationDraft(id,text){
-  try{
-    const _msg=(typeof $==='function')?$('msg'):null;
-    if(!_msg||!_msg.dataset) return;
-    const _id=_normalizeGoalContinuationId(id);
-    if(!_id){ delete _msg.dataset.goalContinuationId; delete _msg.dataset.goalContinuationText; return; }
-    _msg.dataset.goalContinuationId=_id;
-    _msg.dataset.goalContinuationText=String(text||'').trim();
-  }catch(_){ }
-}
-function _clearRestoredGoalContinuationDraft(){
-  try{
-    const _msg=(typeof $==='function')?$('msg'):null;
-    if(!_msg||!_msg.dataset) return;
-    delete _msg.dataset.goalContinuationId;
-    delete _msg.dataset.goalContinuationText;
-  }catch(_){ }
-}
 
 function _bgTaskCompleteRingBufferAdd(sid, evt_id) {
   // Missing key → treat as "seen/skip" (return true). The sole caller already
@@ -1245,10 +1189,6 @@ if(typeof document!=='undefined'){
 // setBusy(true) is only called after the first await inside send().
 let _sendInProgress = false;
 let _sendInProgressSid = null;  // session_id of the in-flight send
-// #7855: the continuation ID the IN-FLIGHT send owns. Owned by the send that
-// holds the lock (set with it, cleared with it) so a concurrent requeue can
-// carry the goal forward without any other send ever reading it as its own.
-let _sendInProgressGoalContinuationId='';
 const _sessionTitleProvisionalBySid = new Map();
 // Agent commands that are safe to execute directly in the WebUI even though
 // their canonical command is registered on the backend (for example
@@ -1309,7 +1249,7 @@ function _sessionTitleLooksDefaultOrProvisional(titleText, provisionalText){
 }
 
 function _firstUserMessageTitleCandidate(){
-  const first=(S.messages||[]).find(m=>m&&m.role==='user'&&m._source!=='delegation_wakeup'&&m.content);
+  const first=(S.messages||[]).find(m=>m&&m.role==='user'&&m.content);
   return first?String(first.content||'').trim().slice(0,64):'';
 }
 
@@ -1445,13 +1385,6 @@ async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
   // _defaultMessageMode
-  // #7855 (round 5): bind this invocation's continuation ID before ANY await.
-  // A shared module slot let a concurrent drain publish an ID that this send
-  // would then read mid-await, so a genuine user turn could consume the goal.
-  // Snapshotting the argument synchronously makes the binding call-scoped: the
-  // ID is posted by exactly the send it was handed to, and no other.
-  const _sendOptions=arguments[0]||{};
-  let _goalContinuationId=_normalizeGoalContinuationId(_sendOptions.goalContinuationId);
   // Reject concurrent invocations early — before any await yields control.
   // If a send is already in-flight (e.g. queue drain), re-queue the message
   // instead of silently dropping it.
@@ -1462,27 +1395,13 @@ async function send(){
     const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
     if(_text && _targetSid){
       const _modelState=_chatPayloadModelState();
-      // #7855: the in-flight send is the goal-continuation drain and this
-      // text was what the user typed during it. Carry the ID onto the
-      // requeued entry so the continuation survives the requeue — otherwise
-      // the entry drains later as a pure user message and the goal is lost.
-      const _inflightContId=_normalizeGoalContinuationId(_sendInProgressGoalContinuationId);
-      const _requeueEntry={text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'};
-      if(_inflightContId) _requeueEntry.goal_continuation_id=_inflightContId;
-      queueSessionMessage(_targetSid,_requeueEntry);
+      queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
       _clearComposerAfterQueuedSelectionSend();
       if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
       S.pendingFiles=[];renderTray();
       updateQueueBadge(_targetSid);
       showToast(`Queued: "${_text.slice(0,40)}${_text.length>40?'…':''}"`,2000);
     }
-    return;
-  }
-  if(typeof _isReadOnlySession==='function'&&_isReadOnlySession(S.session)){
-    const _resumeKey='session_resume_in_webui_required';
-    const _resumeTranslated=typeof t==='function'?t(_resumeKey):'';
-    const _resumeMessage=_resumeTranslated&&_resumeTranslated!==_resumeKey?_resumeTranslated:'Resume in WebUI before sending';
-    if(typeof showToast==='function') showToast(_resumeMessage,2600);
     return;
   }
   _sendInProgress = true;
@@ -1496,23 +1415,9 @@ async function send(){
   _flushSelectionBlocksToComposer();
   text=$('msg').value.trim();
   if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
-  // #7855: a refresh-restored continuation contributes its token only when the
-  // user still sends the exact restored text; replaced/abandoned drafts fail
-  // closed. Resolved here — still before the first await.
-  if(!_goalContinuationId){
-    const _restoredDraftGoalContinuationId=_takeRestoredDraftGoalContinuationId(text);
-    if(_restoredDraftGoalContinuationId) _goalContinuationId=_restoredDraftGoalContinuationId;
-  }
-  // The in-flight send owns this ID; a concurrent requeue reads it to carry the
-  // goal forward. Set (and cleared) exactly with the lock, and only now that the
-  // draft form of the token has been resolved.
-  _sendInProgressGoalContinuationId=_goalContinuationId;
   if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
     if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
-    // Release the lock AND its continuation token together — this early return
-    // skips the block that clears them, so a leftover token would be carried
-    // into the NEXT send's requeue.
-    _sendInProgress=false;_sendInProgressSid=null;_sendInProgressGoalContinuationId='';
+    _sendInProgress=false;_sendInProgressSid=null;
     return;
   }
 
@@ -1535,7 +1440,7 @@ async function send(){
   // If busy or a manual compression is still running, handle based on default_message_mode
   if(S.busy||compressionRunning){
     if(text||S.pendingFiles.length){
-      if(!S.session){await newSession();await renderSessionList();}
+      if(!S.session){await newSession();}
       // Busy-control slash commands must be intercepted HERE, before the
       // defaultMessageMode routing block, so the user can always type /steer, /interrupt,
       // /queue, /terminal, /goal, /yolo, or /stop while the agent is running and have
@@ -1547,34 +1452,6 @@ async function send(){
       // or queued as the literal text "/stop" (#6951).
       if(text.startsWith('/')&&!literalSlash){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
-        if(_pc&&_pc.name==='refine'&&typeof executeAgentCommand==='function'){
-          $('msg').value='';autoResize();
-          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-          let _out;
-          try{_out=await executeAgentCommand(text,{name:'refine'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
-          S.messages.push({role:'assistant',content:String(_out||'(no output)'),_ts:Date.now()/1000});
-          if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
-          return;
-        }
-        if(_pc&&_pc.name==='review'&&typeof executeAgentCommand==='function'){
-          $('msg').value='';autoResize();
-          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-          let _out;
-          try{_out=await executeAgentCommand(text,{name:'review'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
-          S.messages.push({role:'assistant',content:String(_out||'(no output)'),_ts:Date.now()/1000});
-          if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
-          return;
-        }
-        if(_pc&&_pc.name==='loop'&&typeof executeAgentCommand==='function'){
-          // /loop status|pause|stop must reach the loop while its own wakeup turn runs.
-          $('msg').value='';autoResize();
-          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-          let _out;
-          try{_out=await executeAgentCommand(text,{name:'loop'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
-          S.messages.push({role:'assistant',content:String(_out||'(no output)'),_ts:Date.now()/1000});
-          if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
-          return;
-        }
         if(_pc&&['steer','interrupt','queue','terminal','goal','yolo','stop'].includes(_pc.name)){
           const _bc=COMMANDS.find(c=>c.name===_pc.name);
           if(_bc){
@@ -1641,7 +1518,7 @@ async function send(){
     if(_cmd){
       let _pushedUser=false;
       if(!_cmd.noEcho){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         _pushedUser=true;
         renderMessages();
@@ -1659,7 +1536,7 @@ async function send(){
     }
     if(_parsedCmd&&!_cmd){
       if(_parsedCmd.name==='pet'){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _petOutput=null;
         try{
@@ -1688,7 +1565,7 @@ async function send(){
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
       if(_agentCmd&&_agentCmd.cli_only){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
@@ -1696,7 +1573,7 @@ async function send(){
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
       if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _agentOutput='(no output)';
         try{
@@ -1711,7 +1588,7 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       if(_agentCmd&&_agentCmd.category==='Plugin'){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _pluginOutput='(no output)';
         try{
@@ -1727,7 +1604,7 @@ async function send(){
       }
       if(_agentCmdName==='moa'){
         const _moaArgs=(text.split(/\s+/).slice(1).join(' ')||'').trim();
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         if(!_moaArgs){
           let _moaUsage='/moa <prompt>';
           try{const _moaCfgU=await api('/api/commands/moa/resolve');_moaUsage=_moaCfgU.usage||_moaUsage;}catch(_eu){}
@@ -1759,7 +1636,7 @@ async function send(){
           _slashDisplayTextOverride=text;
           text=_bundleMessage;
         }catch(e){
-          if(!S.session){await newSession();await renderSessionList();}
+          if(!S.session){await newSession();}
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           S.messages.push({role:'assistant',content:`Bundle command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
           renderMessages();
@@ -1768,7 +1645,7 @@ async function send(){
       }
     }
   }
-  if(!S.session){await newSession();await renderSessionList();}
+  if(!S.session){await newSession();}
 
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;
@@ -1965,12 +1842,7 @@ async function send(){
       profile:S.activeProfile||S.session.profile||'default',
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
-      moa_config:_pendingMoaConfig?true:undefined,
-      // #7855: the admission token for a continuation being drained from the
-      // queue (kept through edits/combines/late sends). Bound to THIS send
-      // invocation, so it is absent on a genuine user turn — which is exactly
-      // the #6885 distinction — and a concurrent drain can never supply it.
-      goal_continuation_id:_goalContinuationId||undefined
+      moa_config:_pendingMoaConfig?true:undefined
     })});
     _pendingMoaConfig=null;
     postStartData = startData;
@@ -2012,14 +1884,7 @@ async function send(){
       stopClarifyPolling();
       // Keep the user's attempted turn by queueing it for after the current run.
       const _retryModelState=_chatPayloadModelState();
-      // #7855: a rejected continuation must keep its admission token. Dropping
-      // it here turned the retry into an ordinary turn and silently ended the
-      // goal loop. Re-read the token from THIS invocation (the rejected POST
-      // already consumed the server side), never from a shared slot.
-      const _retryContId=_normalizeGoalContinuationId(_goalContinuationId);
-      const _retryEntry={text:msgText,files:[],model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'};
-      if(_retryContId) _retryEntry.goal_continuation_id=_retryContId;
-      queueSessionMessage(activeSid,_retryEntry);
+      queueSessionMessage(activeSid,{text:msgText,files:[],model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'});
       updateQueueBadge(activeSid);
       showToast('Current session is still running. Reconnected and queued your message.',2600);
       try{
@@ -2122,7 +1987,7 @@ async function send(){
   // Open SSE stream and render tokens live
   attachLiveStream(activeSid, streamId, uploadedNames);
 
-  }finally{ _sendInProgress=false; _sendInProgressSid=null; _sendInProgressGoalContinuationId=''; }
+  }finally{ _sendInProgress=false; _sendInProgressSid=null; }
 }
 
 async function startRegeneration(sessionId, regenerationRevision){
@@ -3225,8 +3090,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       args:part.args,
       input:part.input,
       function:part.function,
-      command:part.command||part.raw_command||part.original_command,
-      display_command:part.display_command,
+      command:part.command||part.raw_command||part.original_command||part.display_command,
       preview:part.preview||part.summary,
       snippet:part.snippet||part.result||part.output,
       result:part.result,
@@ -3303,8 +3167,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const tid=_anchorSceneToolId(tool);
     const name=_anchorSceneToolName(tool);
     const args=_anchorSceneToolArgs(tool);
-    const command=_anchorSceneStringPayload(tool&&(tool.command||tool.raw_command||tool.original_command))||_anchorSceneStringPayload(args&&(args.cmd||args.command));
-    const displayCommand=_anchorSceneStringPayload(tool&&tool.display_command);
+    const command=_anchorSceneStringPayload(tool&&(tool.command||tool.raw_command||tool.original_command||tool.display_command))||_anchorSceneStringPayload(args&&(args.cmd||args.command));
     const preview=_anchorSceneStringPayload(tool&&(tool.preview||tool.summary));
     const snippet=_anchorSceneStringPayload(tool&&(tool.snippet||tool.result||tool.output));
     const isError=!!(tool&&(tool.is_error||tool.error));
@@ -3315,7 +3178,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       name,
       args,
       command,
-      display_command:displayCommand,
       preview,
       snippet,
       result:_anchorSceneSafePayload(tool&&tool.result)??null,
@@ -3333,7 +3195,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       name,
       args,
       command,
-      display_command:displayCommand,
       preview,
       snippet,
       is_error:isError,
@@ -3587,10 +3448,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(liveCommand&&_empty(tool.command)&&_empty(payload.command)){
       tool.command=liveCommand; payload.command=liveCommand; enriched=true;
     }
-    const liveDisplay=_anchorSceneStringPayload(live.display_command);
-    if(liveDisplay&&_empty(tool.display_command)&&_empty(payload.display_command)){
-      tool.display_command=liveDisplay; payload.display_command=liveDisplay; enriched=true;
-    }
     if(!_empty(live.started_at)&&_empty(tool.started_at)&&_empty(payload.started_at)){
       tool.started_at=live.started_at; payload.started_at=live.started_at; enriched=true;
     }
@@ -3763,7 +3620,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
       return `tool:${row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id||row.row_id||''}`;
     }
-    if(row.role==='prose'||row.role==='thinking') return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    if(row.role==='prose'||row.role==='thinking'){
+      const identity=row.identity&&typeof row.identity==='object'?row.identity:{};
+      const durableId=row.local_id||row.row_id||row.event_id||identity.local_id||identity.row_id||identity.event_id;
+      if(durableId) return `${row.role}:id:${durableId}`;
+      return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    }
     return `${row.role||row.kind}:${row.source_event_type||''}:${row.status||''}:${row.row_id||''}`;
   }
   function _anchorSceneRowHasLiveIdentity(row){
@@ -3876,18 +3738,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const seen=new Set();
     const seenTextKeys=[];
     const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
-    const orderedRows=[];
-    for(const row of projectedRows){
-      if(row&&row.role==='terminal') continue;
-      orderedRows.push(row);
-    }
-    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
-      const bucket=messageRows.get(idx)||[];
-      for(const row of bucket) orderedRows.push(row);
-    }
-    for(const row of projectedRows){
-      if(row&&row.role==='terminal') orderedRows.push(row);
-    }
+    // ── provenance-aware projection mirror tracking ────────────
+    // (allocated below, after the final-answer guards are defined, so slots
+    // are reserved only by projected rows that survive running-row
+    // settlement, final-answer filtering, and same-ID coalescing)
     // #5758 gap: final-segment eligibility must be judged against the LIVE
     // projection's own chronology. The settled per-message tool rows appended
     // into orderedRows above re-list tools that ran EARLIER in the turn, so an
@@ -3903,7 +3757,86 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(idx>lastProjectedToolIndex&&row&&row.role==='prose'&&row.kind==='process_prose'&&String(row.source_event_type||'')==='token'&&String(row.local_id||'').startsWith('live-prose:')) finalSegmentLiveProseRows.add(row);
     });
     const rowIsLiveTokenFinalPrefix=(row,textKey,finalSegmentEligible)=>finalSegmentEligible&&row&&row.role==='prose'&&row.kind==='process_prose'&&String(row.source_event_type||'')==='token'&&String(row.local_id||'').startsWith('live-prose:')&&textKey&&finalKey&&textKey.length<finalKey.length&&finalKey.startsWith(textKey);
-    const pushRow=(row)=>{
+    // ── provenance-aware projection mirror tracking ────────────
+    // Mirror slots are allocated ONLY from projected rows that survive
+    // running-row settlement (_anchorSceneSettleLiveRunningRow), the
+    // final-answer guards, and same-ID coalescing. A projected running
+    // thinking row that is discarded because settled thinking replaced it
+    // must not reserve a mirror slot, or its settled replacement would be
+    // consumed as a mirror and the thinking would disappear entirely.
+    // Mirror capacity is keyed by ROLE + normalized text, never by text alone:
+    // a projected PROSE row and a settled THINKING row can carry the same
+    // normalized text (the content-parts path emits prose and thinking
+    // independently and does not reject cross-role text equality). Keyed by
+    // text alone, a surviving projected prose row reserved a slot that an
+    // EARLIER settled thinking row of the same text then consumed, so the
+    // settled thinking disappeared and the real settled prose survived as a
+    // duplicate.
+    const _mirrorSlotKey=(role,textKey)=>`${String(role||'').toLowerCase()}\u0000${textKey}`;
+    const projectedMirrorSlots={};
+    const _idToLatestSlot={};
+    for(const row of projectedRows){
+      if(!row||row.role==='terminal'||(row.role!=='prose'&&row.role!=='thinking')) continue;
+      // Running rows discarded by settlement (e.g. projected running thinking
+      // with a settled-thinking replacement) allocate no slot.
+      const settledRow=_anchorSceneSettleLiveRunningRow(row,hasSettledThinking);
+      if(!settledRow||typeof settledRow!=='object') continue;
+      const finalSegmentEligible=finalSegmentLiveProseRows.has(row);
+      const textKey=_anchorSceneTextKey(settledRow.text);
+      if(!textKey) continue;
+      // Rows dropped by the final-answer guards allocate no slot either.
+      if(rowIsLiveTokenFinalPrefix(settledRow,textKey,finalSegmentEligible)) continue;
+      if(_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) continue;
+      const key=_anchorSceneExistingRowKey(settledRow)||'__no_key__';
+      const slotKey=_mirrorSlotKey(settledRow.role,textKey);
+      const prevSlot=_idToLatestSlot[key];
+      if(prevSlot){
+        if(prevSlot!==slotKey){
+          // Same identity re-appeared under a different role/text key: move its
+          // single slot to the latest key instead of allocating a second one.
+          projectedMirrorSlots[prevSlot]=(projectedMirrorSlots[prevSlot]||1)-1;
+          if(projectedMirrorSlots[prevSlot]<=0) delete projectedMirrorSlots[prevSlot];
+          _idToLatestSlot[key]=slotKey;
+          projectedMirrorSlots[slotKey]=(projectedMirrorSlots[slotKey]||0)+1;
+        }
+        // Same key + same role/text: the identity already holds one slot; do not
+        // double-count repeated snapshots of the same identity.
+      }else{
+        _idToLatestSlot[key]=slotKey;
+        projectedMirrorSlots[slotKey]=(projectedMirrorSlots[slotKey]||0)+1;
+      }
+    }
+    const _projectedSlotKeys=Object.keys(projectedMirrorSlots);
+    // ── end provenance tracking ────────────────────────────────
+    const _consumeMirror=(role,textKey)=>{
+      if(!role||!textKey) return false;
+      const slotKey=_mirrorSlotKey(role,textKey);
+      if(!projectedMirrorSlots[slotKey]) return false;
+      if(projectedMirrorSlots[slotKey]<=0) return false;
+      projectedMirrorSlots[slotKey]-=1;
+      return true;
+    };
+    const _tryNearOverlapMirror=(role,textKey)=>{
+      if(!role||!textKey||textKey.length<80) return false;
+      const selfKey=_mirrorSlotKey(role,textKey);
+      const rolePrefix=`${String(role||'').toLowerCase()}\u0000`;
+      for(const slotKey of _projectedSlotKeys){
+        // Near-overlap capacity is role-scoped too: a thinking write-up that
+        // happens to contain a projected prose prefix is a different identity
+        // class and must not be consumed by the prose mirror.
+        if(slotKey===selfKey||slotKey.indexOf(rolePrefix)!==0) continue;
+        const pk=slotKey.slice(rolePrefix.length);
+        if(!pk||pk.length<80) continue;
+        if(pk.includes(textKey)||textKey.includes(pk)){
+          if(projectedMirrorSlots[slotKey]>0){
+            projectedMirrorSlots[slotKey]-=1;
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    const pushRow=(row,origin)=>{
       if(!row||typeof row!=='object') return;
       const finalSegmentEligible=finalSegmentLiveProseRows.has(row);
       row=_anchorSceneSettleLiveRunningRow(row,hasSettledThinking);
@@ -3912,11 +3845,36 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(rowIsLiveTokenFinalPrefix(row,textKey,finalSegmentEligible)) return;
       const isTextual=row.role==='prose'||row.role==='thinking';
       if(isTextual&&_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) return;
-      if(isTextual&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
       const key=_anchorSceneExistingRowKey(row);
-      if(key&&seen.has(key)) return;
+      // ── same-identity enrichment: keep latest/richest value ──
+      if(key&&seen.has(key)){
+        const existingIdx=rows.findIndex(r=>_anchorSceneExistingRowKey(r)===key);
+        if(isTextual&&existingIdx>=0){
+          rows[existingIdx]={...rows[existingIdx],...row,display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode)};
+        }
+        return;
+      }
       if(key) seen.add(key);
-      if(isTextual&&textKey) seenTextKeys.push(textKey);
+      // ── provenance-aware mirror consumption (settled rows) ───
+      if(origin==='settled'&&isTextual&&textKey){
+        if(_consumeMirror(row.role,textKey)) return;
+        // Fallback: near-overlap mirror matching for >=80 char texts
+        if(_tryNearOverlapMirror(row.role,textKey)) return;
+      }
+      // ── legacy text-only dedup ────────────────────────────────────
+      // Exact-text dedup applies only to rows without a durable ID
+      // (rows with IDs are already deduped by _anchorSceneExistingRowKey).
+      // Long-text ≥80 near-overlap protection applies unconditionally.
+      if(isTextual&&textKey){
+        const hasDurableId=!!(row.local_id||row.row_id||row.event_id||(row.identity&&(row.identity.local_id||row.identity.row_id||row.identity.event_id)));
+        if(!hasDurableId){
+          if(_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
+          seenTextKeys.push(textKey);
+        }else if(textKey.length>=80){
+          // For rows that carry a durable ID, only the >=80 char near-overlap leg applies
+          if(_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
+        }
+      }
       rows.push({
         ...row,
         display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode),
@@ -3924,7 +3882,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         seq:rows.length,
       });
     };
-    orderedRows.forEach((row)=>pushRow(row));
+    // Phase 1: projected non-terminal rows
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') continue;
+      pushRow(row,'projected');
+    }
+    // Phase 2: settled/backfill rows (from per-message buckets)
+    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
+      const bucket=messageRows.get(idx)||[];
+      for(const row of bucket) pushRow(row,'settled');
+    }
+    // Phase 3: projected terminal rows
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') pushRow(row,'projected');
+    }
     const scene={
       ...base,
       version:'activity_scene_v1',
@@ -5784,7 +5755,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       tc.preview=String(d.preview||tc.preview||'');
     }
     if(d.args!==undefined) tc.args=d.args;
-    if(d.display_command) tc.display_command=String(d.display_command);
     if(d.snippet!==undefined) tc.snippet=d.snippet;
     tc._liveToolCallSignature = _toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
     tc.activityBurstId = Number.isFinite(Number(tc.activityBurstId))
@@ -6296,11 +6266,28 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _showPersistentStateToast(d.kind, d.name||'', {created:String(d.action||'').toLowerCase()==='created'});
     });
 
+    // Stream-local titles survive the delayed done/fade rebind after compression.
+    const _pendingTitleUpdates=new Map();
+    const _pendingTitleExpectedCurrent=new Map();
     source.addEventListener('title',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-      if((d.session_id||activeSid)!==activeSid) return;
-      applySessionTitleUpdate(activeSid, d.title);
+      // Accept either the title TARGET session or the stream OWNER session:
+      // after an A→B compression rotation a reattached listener runs with
+      // activeSid=B, and the server keys this event on the title target (B)
+      // while a mid-stream listener that captured the pre-rotation activeSid=A
+      // must still receive it. Matching either id rejects only genuinely
+      // foreign streams (#7318 re-gate).
+      if((d.session_id||activeSid)!==activeSid && d.stream_owner_session_id!==activeSid) return;
+      const targetSid=d.target_session_id||d.session_id||activeSid;
+      _pendingTitleUpdates.set(targetSid, d.title);
+      _pendingTitleExpectedCurrent.set(targetSid, d.expectedCurrent);
+      // Pass the server-declared previous title as expectedCurrent: after a
+      // compression rotation or SSE reattach, the open session's title is the
+      // malformed persisted value and nothing is remembered provisionally, so
+      // a bare listener-style call would be refused and the recovered title
+      // would only appear after a full reload (#7318 re-gate).
+      applySessionTitleUpdate(targetSid, d.title, {expectedCurrent:d.expectedCurrent});
     });
 
     source.addEventListener('title_status',e=>{
@@ -6372,14 +6359,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(!continuation_prompt||sid!==activeSid)return;
         _applyToAnchor('goal_continue',d,e);
         const _modelState=_chatPayloadModelState();
-        // #7855: the server continuation ID — not the prompt text — is what
-        // admits this turn later, so carry it on the queued entry through
-        // inline edits and combines. An edited/combined/late continuation
-        // keeps its ID and keeps the goal; a genuine user message has none.
         _pendingGoalContinuation={
           sid,
           text:continuation_prompt,
-          goal_continuation_id:String(d.continuation_id||'').trim(),
           model:_modelState.model,
           model_provider:_modelState.model_provider,
           profile:S.activeProfile||'default',
@@ -6427,10 +6409,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _cancelThrottledSnapshotTimer();
       const _doneData=JSON.parse(e.data);
       const _doneEvent=e;
-      // Switch the status footer to "Done" right away on the done event, using the locally
-      // measured duration plus the usage carried by the event itself — no need to wait for the
-      // loadSession round-trip the settled footer normally requires.
-      if(typeof _markLiveRunStatusDone==='function') _markLiveRunStatusDone(_doneData);
       const _finishDone=()=>{
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
@@ -6504,23 +6482,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevCost=(S.session&&S.session.estimated_cost)||0;
           const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
           const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
-          // #6112: capture the pre-settle transcript so the guard after the carry-forward can
-          // put it back. `_carryForwardEphemeralTurnFields` returns the NEW list whenever
-          // either side is empty, so a `done` payload with no messages blanked the whole
-          // visible transcript — and a payload that never received the in-flight assistant
-          // turn (context compression rotating the session at the turn boundary) dropped the
-          // answer the reader was watching. Neither is recoverable downstream: a blank
-          // transcript stays blank, and the #373 no-reply guard is gated on `!assistantText`,
-          // so no "No response received." card is pushed either. A reload restores it because
-          // the server copy was never touched — which is the whole #6112 symptom.
-          let _doneFinalAnswer='';
-          try{ if(typeof _streamDisplay==='function') _doneFinalAnswer=_streamDisplay()||''; }catch(_){}
-          const _preSettle=Array.isArray(S.messages)?S.messages:[];
           S.session=d.session;S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);if(typeof _adoptRegenerationRevision==='function')_adoptRegenerationRevision(d.session);if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
+          if(_pendingTitleUpdates.has(completedSid)){
+            applySessionTitleUpdate(completedSid, _pendingTitleUpdates.get(completedSid), {expectedCurrent:_pendingTitleExpectedCurrent.get(completedSid)});
+            _pendingTitleUpdates.delete(completedSid);
+            _pendingTitleExpectedCurrent.delete(completedSid);
+          }
           // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
           if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
-          // #6112 settle guard.
-          S.messages=_adoptDoneSnapshotMessages(_preSettle, S.messages, _doneFinalAnswer);
           S.messages=_filterRecoveryControlMessages(S.messages || []);
           if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
           if(typeof clearVisibleMessageRowCache==='function') clearVisibleMessageRowCache();
@@ -6690,20 +6659,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
           const _collapsedInPlace=typeof _collapseJustSettledWorklogInPlace==='function'
             && _collapseJustSettledWorklogInPlace(_settledStreamId);
-          // #7676: Transparent Stream has no disclosure group for the compact
-          // pass above, so every turn end fell through to a second FULL render
-          // (`innerHTML=''` rebuild of the whole transcript) just to reach the
-          // final settled state — the widest possible blank window. Finalize the
-          // settled transparent scene IN PLACE instead (the keep-open token is
-          // already disarmed, so the row cap is applied there), and keep the full
-          // rebuild as the fallback whenever that in-place finalize reports it
-          // did nothing or left the turn blank.
-          const _settledInPlace=!!_collapsedInPlace
-            || (typeof _finalizeJustSettledTransparentScene==='function'
-              && _finalizeJustSettledTransparentScene(_settledStreamId));
-          if(!_settledInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
+          if(!_collapsedInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
             _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
-          }else if(!_settledInPlace){
+          }else if(!_collapsedInPlace){
             renderMessages({preserveScroll:true});
           }else if(_doneLiveScrollSnapshot&&typeof _restoreMessageScrollSnapshotSameFrame==='function'){
             _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
@@ -6727,8 +6685,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             model:_goalNext.model,
             model_provider:_goalNext.model_provider,
             profile:_goalNext.profile,
-            // #7855: the admission token survives into the queue entry.
-            goal_continuation_id:_goalNext.goal_continuation_id||'',
           });
           if(typeof updateQueueBadge==='function')updateQueueBadge(_goalNext.sid);
         }
@@ -7327,71 +7283,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(typeof window!=='undefined'){
     window._carryForwardEphemeralTurnFields=_carryForwardEphemeralTurnFields;
   }
-  // #6112 — a `done` settle must never leave the transcript without the final answer.
-  //
-  // The settled snapshot used to be adopted with no questions asked:
-  //     S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);
-  // `_carryForwardEphemeralTurnFields` returns the NEW list unconditionally whenever either
-  // side is empty, so a payload whose `session.messages` was absent, null, or [] replaced the
-  // whole visible transcript with []. Two concrete ways the streamed answer then disappears
-  // while the server copy stays intact:
-  //   1. empty/absent snapshot -> every message the reader was watching is dropped;
-  //   2. snapshot whose transcript simply never received the streamed answer (context
-  //      compression rotates the session at the turn boundary, and the rotated session's
-  //      message list is built without the in-flight assistant turn) -> adopted verbatim, and
-  //      the answer lives only in the live segment, which the settled rebuild throws away.
-  // Either way `_filterRecoveryControlMessages` does not recover it and the #373 no-reply
-  // guard is suppressed (it is gated on `!assistantText`), so NO "No response received." card
-  // is pushed either: the pane just renders empty, exactly as reported, and a reload — which
-  // re-reads the intact server transcript — brings the same answer back.
-  //
-  // The `stream_end` path has had the matching shorter-snapshot protection since #5224/#3195
-  // (`preserveVisibleOnShorterTerminalSnapshot` / prefix+suffix matching). This is the `done`
-  // counterpart: only a snapshot that actually carries the turn's answer may replace what the
-  // reader is already looking at.
-  //
-  // `finalAnswer` is the display-ready streamed text (thinking/tool-call markup already
-  // stripped by the caller). An empty one disables the answer-presence rule, so callers that
-  // cannot supply it keep today's behaviour.
-  function _finalAnswerIsInTranscript(messages, finalAnswer){
-    const answer=String(finalAnswer||'').trim();
-    if(!answer) return true;
-    const tail=answer.slice(-160);
-    const list=Array.isArray(messages)?messages:[];
-    for(const m of list){
-      if(!m||m.role!=='assistant') continue;
-      let c=m.content;
-      if(Array.isArray(c)) c=c.map(p=>(p&&typeof p==='object')?((p.text||p.input_text||'')||''):(p||'')).join('');
-      c=String(c||'').trim();
-      if(!c) continue;
-      if(c===answer) return true;
-      if(answer.indexOf(c)>=0) return true;
-      if(c.indexOf(answer)>=0) return true;
-      if(tail&&c.indexOf(tail)>=0) return true;
-    }
-    return false;
-  }
-  // Settle guard, run right after the #3018 carry-forward assignment in the `done` handler.
-  // `preSettleMessages` is the transcript as the reader was looking at it, `settledMessages`
-  // is what the snapshot reconciled to. Two rules:
-  //   1. an empty settled list may not replace a non-empty transcript — there is nothing in
-  //      it to reconcile, so it would only blank the pane;
-  //   2. whatever wins must still contain the streamed final answer — otherwise the answer is
-  //      re-attached to the tail so the settled rebuild has something to render.
-  function _adoptDoneSnapshotMessages(preSettleMessages, settledMessages, finalAnswer){
-    const pre=Array.isArray(preSettleMessages)?preSettleMessages:[];
-    const settled=Array.isArray(settledMessages)?settledMessages:[];
-    const adopted=settled.length>0;
-    const messages=(adopted||!pre.length)?settled:pre;
-    const answer=String(finalAnswer||'').trim();
-    if(!answer) return {adopted:adopted,messages:messages};
-    if(_finalAnswerIsInTranscript(messages,answer)) return {adopted:adopted,messages:messages};
-    if(!messages.length) return {adopted:adopted,messages:messages};
-    return {adopted:true,messages:messages.concat([{role:'assistant',content:String(finalAnswer)}])};
-  }
-  if(typeof window!=='undefined'){
-    window._adoptDoneSnapshotMessages=_adoptDoneSnapshotMessages;
-  }
 
   async function _restoreSettledSession(source, options=null){
     const returnStatus=!!(options&&options.status);
@@ -7662,7 +7553,7 @@ function transcript(){
   const lines=[`# Hermes session ${S.session?.session_id||''}`,``,
     `Workspace: ${S.session?.workspace||''}`,`Model: ${S.session?.model||''}`,``];
   for(const m of S.messages){
-    if(!m||m.role==='tool'||m._source==='delegation_wakeup')continue;
+    if(!m||m.role==='tool')continue;
     let c=m.content||'';
     if(Array.isArray(c))c=c.filter(p=>p&&p.type==='text').map(p=>p.text||'').join('\n');
     const ct=String(c).trim();
@@ -8969,15 +8860,12 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
       try { _markSessionViewed(sid, (S&&S.session&&S.session.session_id===sid)?(S.session.message_count??(S.messages&&S.messages.length)??0):0); } catch(_){}
       try { if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(sid); } catch(_){}
     } else {
-      // Child report-backs are internal; ordinary process completions still toast.
-      // The diagnostic ack below fires for both kinds.
-      if (d.kind !== 'async_delegation') {
-        try {
-          const tid = (d.task_id || '').slice(0, 8) || '?';
-          const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
-          showToast(`Task ${tid} done${tail}`, 2600);
-        } catch (_) {}
-      }
+      // T4 drop-when-focused: suppress toast only; ack below still fires.
+      try {
+        const tid = (d.task_id || '').slice(0, 8) || '?';
+        const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
+        showToast(`Task ${tid} done${tail}`, 2600);
+      } catch (_) {}
     }
 
     // Fire-and-forget ack (diagnostic only — Option Z made this a no-op for
@@ -9815,9 +9703,24 @@ function playAttentionSound(key){
 }
 
 function _notificationOptions(body,options={}){
-  const sid=(options&&options.sid)||(S&&S.session&&S.session.session_id);
-  const url=sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href;
-  return {body:body||'',tag:sid?`hermes-${sid}`:'hermes-webui',renotify:true,icon:'static/favicon-192.png',badge:'static/favicon-32.png',data:{url}};
+  // #7652 review: a falsy sid used to fall through to the CURRENT session, so
+  // a notification for a sessionless surface (e.g. a cron completion with no
+  // session_id) opened whatever chat the user happened to be in and reused its
+  // notification tag. An explicit {sessionless:true} marker routes away from
+  // the current session, with its own tag, instead.
+  const sessionless=!!(options&&options.sessionless);
+  const sid=sessionless?null:((options&&options.sid)||(S&&S.session&&S.session.session_id));
+  // A sessionless surface still needs a DESTINATION to land on: the root URL
+  // alone restores whatever chat was last open (boot's saved-session restore),
+  // so the alert about a cron run opened the chat instead of the panel the run
+  // belongs to (#7652 review round 4). An explicit panel intent is carried in
+  // the URL; boot honors it ahead of the saved-chat restore.
+  const panel=(options&&options.panel)?String(options.panel).slice(0,64):'';
+  const rootWithPanelIntent=panel
+    ? `${location.origin}${_appRootPath()}${_appRootPath().includes('?')?'&':'?'}panel=${encodeURIComponent(panel)}`
+    : `${location.origin}${_appRootPath()}`;
+  const url=sessionless?rootWithPanelIntent:(sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href);
+  return {body:body||'',tag:sessionless?'hermes-webui-sessionless':(sid?`hermes-${sid}`:'hermes-webui'),renotify:true,icon:'static/favicon-192.png',badge:'static/favicon-32.png',data:{url}};
 }
 function _showPwaNotification(title,body,options={}){
   const botName=assistantDisplayName();

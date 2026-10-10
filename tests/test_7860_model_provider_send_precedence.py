@@ -143,7 +143,7 @@ if (cfg.dropdown) {
 
 
 def _run(scenario):
-    driver = _DRIVER_SRC.replace("__UI_JS_PATH__", UI_JS_PATH.as_posix())
+    driver = _DRIVER_SRC.replace("__UI_JS_PATH__", str(UI_JS_PATH))
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write(driver)
         tmp = f.name

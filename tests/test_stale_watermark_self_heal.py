@@ -153,10 +153,106 @@ def test_stale_watermark_newer_than_sidecar_is_ignored():
         ("user", "q2", 200),
         ("assistant", "a2", 250),
     )
+    # The pre-fix wall-clock advance moved ONLY the watermark; it never wrote
+    # truncation_boundary, so the realistic stale shape has no matching boundary.
     merged = models.merge_session_messages_append_only(
-        sidecar, state, truncation_watermark=9999.0, truncation_boundary=9999.0
+        sidecar, state, truncation_watermark=9999.0, truncation_boundary=None
     )
     assert [m["content"] for m in merged] == ["q1", "a1", "q2", "a2"]
+
+
+def test_stale_watermark_above_an_older_real_boundary_still_heals():
+    """A session truncated at a real kept-row ts (B=50) whose sidecar then
+    advanced (a1 at 100) and LATER hit the wall-clock advance still self-heals:
+    the watermark moved away from the persisted boundary and the cutoff is not
+    the newest sidecar row, so the heal target is unambiguous."""
+    sidecar = _rows(("user", "q1", 50), ("assistant", "a1", 100))
+    state = _rows(
+        ("user", "q1", 50),
+        ("assistant", "a1", 100),
+        ("user", "q2", 200),
+        ("assistant", "a2", 250),
+    )
+    merged = models.merge_session_messages_append_only(
+        sidecar, state, truncation_watermark=9999.0, truncation_boundary=50.0
+    )
+    assert [m["content"] for m in merged] == ["q1", "a1", "q2", "a2"]
+
+
+def _p7_state():
+    return _rows(
+        ("user", "q1", 50),
+        ("assistant", "a1", 100),
+        ("user", "DELETED-q2", 150),
+        ("assistant", "DELETED-a2", 160),
+        ("user", "q3-new", 300),
+        ("assistant", "a3-new", 310),
+    )
+
+
+def test_ambiguous_cutoff_at_newest_sidecar_row_never_resurrects_deleted_rows():
+    """#7946 gate c17 (Codex CORE): truncate/edit at B=100 == the newest
+    timestamped sidecar row, the post-edit turn absent from the sidecar, then
+    the stale wall-clock watermark. Nothing persisted marks where the deleted
+    suffix ends, so the heal must not run: the deleted 150/160 rows stay out,
+    exactly as on master."""
+    sidecar = _rows(("user", "q1", 50), ("assistant", "a1", 100))
+    merged = models.merge_session_messages_append_only(
+        sidecar, _p7_state(), truncation_watermark=9999.0, truncation_boundary=100.0
+    )
+    contents = [m["content"] for m in merged]
+    assert "DELETED-q2" not in contents
+    assert "DELETED-a2" not in contents
+
+
+def test_ambiguous_cutoff_with_untimestamped_replacement_stays_conservative():
+    """Same ambiguity when the post-edit replacement reached the sidecar but
+    without a timestamp: the newest TIMESTAMPED sidecar row is still the cutoff,
+    so deleted rows must not come back."""
+    sidecar = _rows(
+        ("user", "q1", 50),
+        ("assistant", "a1", 100),
+        ("user", "q3-new", None),
+    )
+    merged = models.merge_session_messages_append_only(
+        sidecar, _p7_state(), truncation_watermark=9999.0, truncation_boundary=100.0
+    )
+    contents = [m["content"] for m in merged]
+    assert "DELETED-q2" not in contents
+    assert "DELETED-a2" not in contents
+
+
+def test_manual_compression_cutoff_above_untimestamped_sidecar_tail_is_kept():
+    """#7946 review (CORE, data-loss direction): manual compression is a
+    LEGITIMATE cutoff that can sit above every timestamped sidecar row.
+
+    It stamps missing timestamps on a compressed COPY with the current time and
+    sets truncation_watermark == truncation_boundary from that copy, leaving
+    session.messages unchanged. When the sidecar's newest row has no timestamp,
+    the real cutoff is newer than every timestamped sidecar row. That must NOT
+    be mistaken for the stale wall-clock shape: the pre-compression state.db
+    row the compression removed has to stay out (#4836), exactly as on master.
+    """
+    t0 = 1000.0
+    sidecar = _rows(
+        ("user", "q1", t0),
+        ("assistant", "a1", t0 + 1),
+        ("user", "q2", t0 + 2),
+        ("assistant", "a2 (no ts)", None),
+    )
+    state = _rows(
+        ("user", "q1", t0),
+        ("assistant", "a1", t0 + 1),
+        ("user", "q2", t0 + 2),
+        ("assistant", "removed by compression", t0 + 3),
+    )
+    merged = models.merge_session_messages_append_only(
+        sidecar, state,
+        truncation_watermark=t0 + 500, truncation_boundary=t0 + 500,
+    )
+    contents = [m["content"] for m in merged]
+    assert "removed by compression" not in contents
+    assert contents[:3] == ["q1", "a1", "q2"]
 
 
 def test_legitimate_edit_watermark_still_filters_replaced_tail():
@@ -263,10 +359,71 @@ def test_frozen_session_signature_recovers_all_later_turns():
     merged = models.merge_session_messages_append_only(
         sidecar, state,
         truncation_watermark=2500.0,   # wall-clock: > every sidecar ts
-        truncation_boundary=2500.0,
+        truncation_boundary=None,      # the wall-clock writer never set it
     )
     assert [m["content"] for m in merged] == [
         "q1", "a1", "last before freeze",
         "q2 after freeze", "a2 after freeze",
         "q3 much later", "a3 much later",
+    ]
+
+
+def test_stale_watermark_above_a_compression_cutoff_heals_without_replay():
+    """#7946 gate (Codex CORE + senior review): a session manually compressed at
+    C=1500 and only LATER hit by the pre-fix wall-clock advance (W=2000 > C >
+    every timestamped sidecar row). Clearing the watermark would replay the
+    pre-compression rows the compression discarded (#4836). Healing to the
+    recorded cutoff keeps them hidden and still merges every turn after it."""
+    sidecar = _rows(
+        ("user", "q1", 1000),
+        ("assistant", "a1", 1001),
+        ("user", "q2", 1002),
+        ("assistant", "a2 (no ts)", None),
+    )
+    state = _rows(
+        ("user", "q1", 1000),
+        ("assistant", "a1", 1001),
+        ("user", "q2", 1002),
+        ("assistant", "discarded by compression", 1003),
+        ("user", "discarded user", 1004),
+        ("user", "q3 after compression", 1600),
+        ("assistant", "a3 after compression", 1700),
+    )
+    merged = models.merge_session_messages_append_only(
+        sidecar, state, truncation_watermark=2000.0, truncation_boundary=1500.0
+    )
+    contents = [m["content"] for m in merged]
+    assert "discarded by compression" not in contents
+    assert "discarded user" not in contents
+    assert "q3 after compression" in contents
+    assert "a3 after compression" in contents
+
+
+def test_stale_watermark_after_truncate_keeps_the_deleted_suffix_hidden():
+    """A truncate/edit at B=100 replaced the q2/a2 suffix; the post-edit turn
+    reached the sidecar (newest timestamped row 310); a later handoff turn then
+    stamped the wall-clock watermark. The heal targets the newest real cutoff
+    (310 here), so the replaced suffix stays hidden and only the turns that
+    landed during the freeze merge back."""
+    sidecar = _rows(
+        ("user", "q1", 50),
+        ("assistant", "a1", 100),
+        ("user", "q2-new", 300),
+        ("assistant", "a2-new", 310),
+    )
+    state = _rows(
+        ("user", "q1", 50),
+        ("assistant", "a1", 100),
+        ("user", "replaced-q2", 150),
+        ("assistant", "replaced-a2", 160),
+        ("user", "q2-new", 300),
+        ("assistant", "a2-new", 310),
+        ("user", "q3 during freeze", 400),
+        ("assistant", "a3 during freeze", 410),
+    )
+    merged = models.merge_session_messages_append_only(
+        sidecar, state, truncation_watermark=9999.0, truncation_boundary=100.0
+    )
+    assert [m["content"] for m in merged] == [
+        "q1", "a1", "q2-new", "a2-new", "q3 during freeze", "a3 during freeze",
     ]

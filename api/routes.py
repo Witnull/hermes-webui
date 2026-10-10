@@ -31,8 +31,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
-from api.session_persistence import session_persistence_gate, revoke_session_persistence
-from contextlib import closing, nullcontext
+from contextlib import closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -51,28 +50,11 @@ from api.agent_sessions import (
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
-from api.process_event_utils import is_hidden_transcript_row
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
     clear_compression_recovery,
     compression_recovery_payload_for_session,
     is_generic_continuation_intent,
-)
-from api.idempotency import (
-    IDEM_KEY_ABSENT,
-    IdempotencyConflict,
-    IdempotencyInFlight,
-    IdempotencyKeyExpired,
-    IdempotencyKeyMalformed,
-    IdempotencyKeyMissing,
-    IdempotencyOutcomeUnknown,
-    IdempotencyStoreUnavailable,
-    build_response_payload as _idem_build_response_payload,
-    compute_request_fingerprint as _idem_compute_fingerprint,
-    extract_key as _idem_extract_key,
-    get_idempotency_store,
-    resolve_active_profile as _idem_resolve_active_profile,
-    validate_key as _idem_validate_key,
 )
 from api.session_events import (
     add_session_list_changed_listener,
@@ -179,7 +161,7 @@ def _persist_generated_session_title(
         with LOCK:
             SESSIONS[sid] = session
             SESSIONS.move_to_end(sid)
-        _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
+            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     _sync_session_title_to_insights(session)
     _publish_session_list_changed(
         event_reason,
@@ -326,7 +308,7 @@ def _normalize_cron_job_ids(job_ids) -> list[str]:
 
 
 def _latest_cron_session_info_for_jobs(
-    job_ids, completed_job_ids=None, deadline_s: float | None = None
+    job_ids, completed_job_ids=None
 ) -> dict[str, dict[str, int | str | None]]:
     """Return newest persisted cron session info keyed by completed cron job id."""
     normalized = _normalize_cron_job_ids(job_ids)
@@ -334,164 +316,6 @@ def _latest_cron_session_info_for_jobs(
     if not requested:
         return {}
     if not normalized:
-        return {jid: {"session_id": "", "message_count": None} for jid in requested}
-    db_path = _active_state_db_path()
-    if not db_path or not Path(db_path).exists():
-        return {jid: {"session_id": "", "message_count": None} for jid in requested}
-    bounds = []
-    for jid in requested:
-        lo = f"cron_{jid}_"
-        bounds.append((lo, lo + chr(0x10FFFF)))
-    id_clause = (
-        "(" + " OR ".join("(s.id >= ? AND s.id < ?)" for _ in bounds) + ")"
-    )
-    id_params = [v for lo, hi in bounds for v in (lo, hi)]
-    try:
-        if deadline_s is None:
-            conn = open_state_db_readonly(db_path)
-        else:
-            conn = open_state_db_readonly(
-                db_path, timeout=deadline_s, deadline_s=deadline_s
-            )
-        with closing(conn):
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            session_cols = {row[1] for row in cur.fetchall()}
-            if "id" not in session_cols or "source" not in session_cols:
-                return {jid: {"session_id": "", "message_count": None} for jid in requested}
-            select_message_count = (
-                "s.message_count AS message_count"
-                if "message_count" in session_cols
-                else "NULL AS message_count"
-            )
-            if "started_at" in session_cols:
-                query = f"""
-                    SELECT s.id,
-                           {select_message_count}
-                    FROM sessions s
-                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
-                      AND {id_clause}
-                    ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC
-                """
-            else:
-                query = f"""
-                    SELECT s.id,
-                           {select_message_count}
-                    FROM sessions s
-                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
-                      AND {id_clause}
-                    ORDER BY s.id DESC
-                """
-            cur.execute(query, id_params)
-            results = {
-                jid: {"session_id": "", "message_count": None} for jid in requested
-            }
-            requested_ids = set(requested)
-            prefixes = {jid: f"cron_{jid}_" for jid in normalized}
-            for row in cur.fetchall():
-                sid = str(row["id"] or "")
-                if not sid:
-                    continue
-                matches = [
-                    jid
-                    for jid in normalized
-                    if sid.startswith(prefixes[jid])
-                ]
-                if matches:
-                    jid = max(matches, key=len)
-                    if jid not in requested_ids or results[jid]["session_id"]:
-                        continue
-                    results[jid] = {
-                        "session_id": sid,
-                        "message_count": (
-                            int(row["message_count"])
-                            if row["message_count"] is not None
-                            else None
-                        ),
-                    }
-                if all(info["session_id"] for info in results.values()):
-                    break
-            return results
-    except sqlite3.Error:
-        if deadline_s is not None:
-            raise
-        return {jid: {"session_id": "", "message_count": None} for jid in requested}
-    db_path = _active_state_db_path()
-    if not db_path or not Path(db_path).exists():
-        return {jid: {"session_id": "", "message_count": None} for jid in requested}
-    bounds = []
-    for jid in requested:
-        lo = f"cron_{jid}_"
-        bounds.append((lo, lo + chr(0x10FFFF)))
-    id_clause = (
-        "(" + " OR ".join("(s.id >= ? AND s.id < ?)" for _ in bounds) + ")"
-    )
-    id_params = [v for lo, hi in bounds for v in (lo, hi)]
-    try:
-        if deadline_s is None:
-            conn = open_state_db_readonly(db_path)
-        else:
-            conn = open_state_db_readonly(
-                db_path, timeout=deadline_s, deadline_s=deadline_s
-            )
-        with closing(conn):
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            cols = {row["name"] for row in cur.fetchall()}
-            select_started = "s.started_at," if "started_at" in cols else ""
-            select_message_count = "s.message_count" if "message_count" in cols else "NULL as message_count"
-            if "started_at" in cols:
-                query = f"""
-                    SELECT s.id,
-                           {select_started}
-                           {select_message_count}
-                    FROM sessions s
-                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
-                      AND {id_clause}
-                    ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC
-                """
-            else:
-                query = f"""
-                    SELECT s.id,
-                           {select_message_count}
-                    FROM sessions s
-                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
-                      AND {id_clause}
-                    ORDER BY s.id DESC
-                """
-            cur.execute(query, id_params)
-            results = {
-                jid: {"session_id": "", "message_count": None} for jid in requested
-            }
-            unmatched = set(requested)
-            for row in cur.fetchall():
-                sid = str(row["id"] or "").strip()
-                count = row["message_count"]
-                if count is not None:
-                    try:
-                        count = max(0, int(count))
-                    except (ValueError, TypeError):
-                        count = None
-                parsed_job_id = None
-                for jid in requested:
-                    prefix = f"cron_{jid}_"
-                    if sid.startswith(prefix):
-                        parsed_job_id = jid
-                        break
-                if parsed_job_id and parsed_job_id in unmatched:
-                    results[parsed_job_id] = {
-                        "session_id": sid,
-                        "message_count": count,
-                    }
-                    unmatched.remove(parsed_job_id)
-                if not unmatched:
-                    break
-            return results
-    except sqlite3.Error:
-        if deadline_s is not None:
-            raise
         return {jid: {"session_id": "", "message_count": None} for jid in requested}
     db_path = _active_state_db_path()
     if not db_path or not Path(db_path).exists():
@@ -613,7 +437,7 @@ def _session_row_lineage_root_id(session, sessions_by_id) -> str:
     return current or sid
 
 
-def _visible_pinned_lineage_ids(session_rows) -> set[str]:
+def _visible_pinned_lineage_ids(session_rows, excluding=None, profiles=None) -> set[str]:
     sessions_by_id = {}
     for row in session_rows:
         sid = str(_session_field(row, "session_id", "") or "")
@@ -623,9 +447,13 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
     for row in session_rows:
         if not _session_counts_toward_pin_quota(row):
             continue
+        if profiles is not None and str(_session_field(row, "profile", None) or "default") not in profiles:
+            continue
         root = _session_row_lineage_root_id(row, sessions_by_id)
         if root:
             roots.add(root)
+    if excluding is not None:
+        roots.discard(_session_row_lineage_root_id(excluding, sessions_by_id))
     return roots
 
 
@@ -650,6 +478,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
     _is_isolated_profile_mode,
     _is_root_profile,
+    _root_profile_names_snapshot,
     _SKILLS_STATS_CACHE,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
@@ -711,6 +540,45 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     if not isinstance(session_profile, str):
         session_profile = None
     return _profiles_match(session_profile, active_profile)
+
+
+def _retag_empty_session_profile(session, requested_profile):
+    """Atomically retag an empty, unpinned placeholder with pin admission."""
+    # Warm the canonical root-alias cache before LOCK, then use its snapshot
+    # below so a concurrent cache invalidation cannot trigger listing in-LOCK.
+    _profiles_match(getattr(session, "profile", None), requested_profile)
+    root_profile_names = set(_root_profile_names_snapshot() or ()) | {"default"}
+    with LOCK:
+        session_profile = getattr(session, "profile", None)
+        row_profile = session_profile or "default"
+        requested_owner = requested_profile or "default"
+        if row_profile == requested_owner or (
+            row_profile in root_profile_names and requested_owner in root_profile_names
+        ):
+            return session_profile, "same_owner"
+        has_persisted_turns = bool(
+            getattr(session, "messages", None)
+            or getattr(session, "context_messages", None)
+            or getattr(session, "pending_user_message", None)
+        )
+        is_pinned = bool(getattr(session, "pinned", False))
+        if has_persisted_turns:
+            return session_profile, "nonempty"
+        if is_pinned:
+            return session_profile, "pinned_empty"
+        session.profile = requested_profile
+        return requested_profile, "retagged"
+
+
+def _session_profile_mismatch_response(handler, session_id, session_profile):
+    if session_profile:
+        return j(handler, {
+            "error": "Session belongs to a different profile",
+            "code": "session_profile_mismatch",
+            "session_id": session_id,
+            "profile": session_profile,
+        }, status=409)
+    return bad(handler, "Session not found", 404)
 
 
 def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
@@ -1073,15 +941,6 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     This mirrors ``tools.skills_tool.skills_list`` closely, but keeps the local
     scan root explicit so per-client WebUI profile switches do not race on or
     leak through the skills tool's module-global ``SKILLS_DIR``.
-
-    Plugin-registered skills (Hermes Agent plugin manager) are merged into the
-    result so the WebUI's ``GET /api/skills`` and slash-command autocomplete
-    surface them alongside directory-installed skills (#7770). The plugin
-    manager import is best-effort: a WebUI deployment that runs without
-    Hermes Agent (or where ``hermes_cli.plugins`` cannot be imported) gets the
-    directory-only listing it had before, not a 500. The category filter
-    treats ``"plugin"`` as its own bucket; a non-plugin category excludes them
-    and ``category=None`` returns the combined set.
     """
     from agent.skill_utils import iter_skill_index_files
     from tools.skills_tool import (
@@ -1092,21 +951,14 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
         skill_matches_platform,
     )
 
-    # A missing local skills directory must NOT suppress plugin-registered
-    # skills. Plugin skills (e.g. obra/superpowers via `hermes plugins install
-    # obra/superpowers --enable`) are visible to the agent's
-    # skill_view('plugin:skill') even when ~/.hermes/skills has never been
-    # created, so /api/skills must surface them in the same shape the agent
-    # does (#7770). We still create the directory for backward compatibility
-    # (a user with no local skills now has a writable home for new ones) and
-    # then fall through to the directory-scan + plugin-merge path below. The
-    # search_dirs filter returns an empty list because the freshly-created
-    # dir has no SKILL.md children, so the loop body is a no-op and
-    # plugin-merge still runs.
-    created_local_dir = False
     if not skills_dir.exists():
         skills_dir.mkdir(parents=True, exist_ok=True)
-        created_local_dir = True
+        return {
+            "success": True,
+            "skills": [],
+            "categories": [],
+            "message": f"No skills found. Skills directory created at {skills_dir}/",
+        }
 
     all_skills = []
     seen_names: set[str] = set()
@@ -1153,21 +1005,6 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
                     "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
                 )
 
-    # Surface plugin-registered skills alongside directory skills so the
-    # WebUI's /api/skills endpoint and the slash-command autocomplete see the
-    # same set the agent's `skills_list` does (#7770). Plugin-skill entries
-    # use the qualified ``plugin:skill`` form and carry an explicit
-    # ``source: "plugin"`` marker so the frontend can group/label them
-    # distinctly without losing round-trip identity. The plugin manager
-    # import is best-effort; an isolated WebUI (no agent on sys.path) returns
-    # an empty list here and the directory listing still ships.
-    for plugin_entry in _list_plugin_skills_for_response():
-        plugin_name = plugin_entry.get("name")
-        if not plugin_name or plugin_name in seen_names:
-            continue
-        seen_names.add(plugin_name)
-        all_skills.append(plugin_entry)
-
     if category:
         all_skills = [s for s in all_skills if s.get("category") == category]
     all_skills = _sort_skills(all_skills)
@@ -1181,14 +1018,7 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     if all_skills:
         result["hint"] = "Use skill_view(name) to see full content, tags, and linked files"
     else:
-        if created_local_dir:
-            # Mirror the pre-#7770 user-facing notice: a first-time /api/skills
-            # call that finds no local skills and no plugin skills still gets
-            # the "directory created" hint so the Settings panel does not
-            # appear silently broken.
-            result["message"] = f"No skills found. Skills directory created at {skills_dir}/"
-        else:
-            result["message"] = "No skills found in skills/ directory."
+        result["message"] = "No skills found in skills/ directory."
     return result
 
 
@@ -2706,15 +2536,6 @@ def _build_session_list_cache_payload(
             show_kanban_sessions=show_kanban_sessions,
             source_filter=source_filter,
         )
-        # Keep the list payload consistent with the detail payload.  In
-        # operator projection mode every row here is a foreign state.db row;
-        # copy before stamping so the cached source rows remain untouched.
-        # The frontend requires read_only=true before it will expose the
-        # explicit Resume in WebUI action for an eligible CLI/TUI/Desktop row.
-        if str(os.getenv("HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY", "")).strip().lower() in {
-            "1", "true", "yes", "on",
-        }:
-            deduped_cli = [dict(s, read_only=True) for s in deduped_cli]
     else:
         diag_stage("filter_webui_sessions")
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
@@ -2737,13 +2558,6 @@ def _build_session_list_cache_payload(
         key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
         reverse=True,
     )
-    # Each sidebar tab is loaded on its own, so a child can arrive without its parent's row.
-    # Stamp the parent's tab (the same classifier _filter_sidebar_source uses) on the child.
-    _merged_by_id = {s.get("session_id"): s for s in merged if s.get("session_id")}
-    for s in merged:
-        _parent = _merged_by_id.get(s.get("parent_session_id"))
-        if _parent is not None:
-            s["parent_is_cli_session"] = _is_cli_session_for_settings(_parent)
     # ── Profile scoping (#1611) ────────────────────────────────────────
     # Default: filter to the active profile. ?all_profiles=1 opts into
     # the aggregate view used by the "All profiles" sidebar toggle.
@@ -3188,6 +3002,9 @@ from api.config import (
     set_reasoning_display,
     set_reasoning_effort,
     create_stream_channel,
+    publish_pre_admission_claim,
+    retire_pre_admission_claim_if_owned,
+    is_orphaned_stream,
     get_config,
     get_webui_session_save_mode,
     get_config_snapshot,
@@ -3195,8 +3012,6 @@ from api.config import (
     PENDING_GOAL_CONTINUATION,
     _get_config_path,
     _load_yaml_config_file,
-    _load_yaml_config_file_raw,
-    _expand_env_vars,
     _save_yaml_config_file,
     reload_config,
     get_config_for_profile_home,
@@ -3211,6 +3026,7 @@ from api.helpers import (
     safe_resolve,
     arm_connection_close_if_body_pending,
     j,
+    _json_response_body,
     t,
     read_body,
     MAX_BODY_BYTES,
@@ -3394,7 +3210,7 @@ def _cancelled_run_is_stale(run_entry) -> bool:
         return False
 
 
-def _clear_stale_stream_state(session) -> bool:
+def _clear_stale_stream_state(session, *, wait_for_writer: bool = False) -> bool:
     """Clear persisted streaming flags when the in-memory stream no longer exists.
 
     A server restart or worker crash can leave active_stream_id/pending_* in the
@@ -3471,6 +3287,13 @@ def _clear_stale_stream_state(session) -> bool:
         )
         return False
 
+    # Observation must not queue behind a worker committing a large transcript.
+    # The locked() probe avoids a needless full reload; acquire below is the
+    # actual synchronization check and also covers a writer starting afterward.
+    session_lock = _get_session_agent_lock(session.session_id)
+    if not wait_for_writer and session_lock.locked():
+        return False
+
     # ── #1558 P0 safety: if we were handed a metadata-only stub, reload the
     # full session before touching persisted state. The original
     # metadata-only object is left untouched so the caller's read path is
@@ -3521,7 +3344,9 @@ def _clear_stale_stream_state(session) -> bool:
     # active_stream_id under it. A concurrent chat_start may have already
     # registered a new stream after our STREAMS_LOCK check above; in that
     # case we must NOT clobber its session.active_stream_id.
-    with _get_session_agent_lock(session.session_id):
+    if not session_lock.acquire(blocking=wait_for_writer):
+        return False
+    try:
         if getattr(session, "active_stream_id", None) != stream_id:
             return False
         if getattr(session, "pending_user_message", None):
@@ -3579,6 +3404,8 @@ def _clear_stale_stream_state(session) -> bool:
                 "_clear_stale_stream_state: save() failed for session %s",
                 getattr(session, "session_id", "?"),
             )
+    finally:
+        session_lock.release()
     # Patch the caller's stub (if different from the full-load object) so
     # its in-memory active_stream_id matches what just got persisted.
     if original_stub is not session:
@@ -4422,7 +4249,7 @@ def _ensure_full_session_before_mutation(sid: str, session):
     with LOCK:
         SESSIONS[sid] = full_session
         SESSIONS.move_to_end(sid)
-    _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
+        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     return full_session
 
 
@@ -4463,179 +4290,6 @@ def _anchor_scene_message_ref_digest(payload: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _anchor_scene_json_dumps(scene) -> str:
-    return json.dumps(scene, ensure_ascii=False, separators=(",", ":"), default=str)
-
-
-def _anchor_scene_fits_size_cap(scene) -> bool:
-    return len(_anchor_scene_json_dumps(scene).encode("utf-8")) <= _ANCHOR_ACTIVITY_SCENE_MAX_BYTES
-
-
-# Row roles a size-capped scene drops first, least expendable last: tool and
-# thinking rows carry the Worklog's actual work record; boundary/status
-# scaffolding is what reloads least miss.
-_ANCHOR_SCENE_DROP_ROLE_ORDER = (
-    "terminal", "control", "lifecycle", "activity", "prose", "tool", "thinking",
-)
-# Field-clamp bounds for the degrade path: a single huge leaf (a giant tool
-# result, an over-long reasoning blob) shrinks to a bounded preview before
-# whole rows are dropped.
-_ANCHOR_SCENE_FIELD_CLAMP_MAX_BYTES = 32_000
-_ANCHOR_SCENE_FIELD_CLAMP_MIN_BYTES = 4_000
-_ANCHOR_SCENE_FIELD_CLAMP_SUFFIX = "\n\n[…truncated to fit the persisted Worklog scene cap…]"
-
-
-def _anchor_scene_clamp_string(value: str, budget: int) -> str:
-    raw = value.encode("utf-8")
-    if len(raw) <= budget:
-        return value
-    return raw[:budget].decode("utf-8", "ignore") + _ANCHOR_SCENE_FIELD_CLAMP_SUFFIX
-
-
-def _anchor_scene_clamp_long_strings(node, budget: int, stats) -> None:
-    """Clamp every string leaf over ``budget`` bytes in place; stats[0] counts
-    clamped fields."""
-    if isinstance(node, dict):
-        for key, value in list(node.items()):
-            if isinstance(value, str):
-                if len(value.encode("utf-8")) > budget:
-                    node[key] = _anchor_scene_clamp_string(value, budget)
-                    stats[0] += 1
-            else:
-                _anchor_scene_clamp_long_strings(value, budget, stats)
-    elif isinstance(node, list):
-        for item in node:
-            _anchor_scene_clamp_long_strings(item, budget, stats)
-
-
-def _anchor_scene_dedupe_row(row) -> int:
-    """Drop a row's byte-for-byte fallback copies; returns removed field count.
-
-    A settled thinking row carries the same reasoning in ``text``,
-    ``thinking.text`` and ``payload.*`` (~4x the bytes), and a settled tool
-    row carries args/snippet in ``tool``, ``payload`` and ``text``. The
-    renderer resolves ``row.text`` before ``row.thinking.text`` and the
-    ``tool`` card before its ``payload`` mirrors, so these copies are safe to
-    drop (mirrors the live transport's projection).
-    """
-    removed = 0
-    role = str(row.get("role") or "")
-    thinking = row.get("thinking")
-    if role == "thinking" and isinstance(thinking, dict):
-        thinking_text = thinking.get("text")
-        if isinstance(thinking_text, str) and thinking_text:
-            if not row.get("text"):
-                row["text"] = thinking_text
-            if thinking_text == row.get("text"):
-                row.pop("thinking", None)
-                removed += 1
-    payload = row.get("payload")
-    if isinstance(payload, dict):
-        text = row.get("text")
-        if isinstance(text, str) and text:
-            for key in list(payload.keys()):
-                if payload.get(key) == text:
-                    payload.pop(key, None)
-                    removed += 1
-    if role == "tool" and isinstance(row.get("tool"), dict):
-        tool = row["tool"]
-        if tool.get("preview") == tool.get("snippet"):
-            tool.pop("preview", None)
-            removed += 1
-        if tool.get("tid") == tool.get("id"):
-            tool.pop("tid", None)
-            removed += 1
-        if isinstance(payload, dict):
-            for pkey, tkey in (
-                ("id", "id"), ("tid", "id"), ("name", "name"), ("args", "args"),
-                ("command", "command"), ("preview", "preview"), ("snippet", "snippet"),
-                ("result", "result"), ("output", "output"), ("is_error", "is_error"),
-                ("duration", "duration"), ("started_at", "started_at"),
-            ):
-                if pkey in payload and payload.get(pkey) == tool.get(tkey):
-                    payload.pop(pkey, None)
-                    removed += 1
-        if "text" in row:
-            row.pop("text", None)
-            removed += 1
-    return removed
-
-
-def _degrade_anchor_activity_scene(scene):
-    """Shrink an over-cap scene instead of rejecting it (#7969).
-
-    A persisted scene that crosses the byte cap used to be rejected whole —
-    the settled Worklog silently vanished on reload. Degrade in order of
-    least loss until the scene fits (or can't shrink further, in which case
-    the caller still rejects):
-
-    1. drop ``side_effects``/``artifacts`` — outcome metadata also carried by
-       the outcome records, while ``activity_rows`` is the Worklog itself;
-    2. de-duplicate each row's byte-for-byte fallback copies;
-    3. clamp oversized leaf strings to a bounded preview;
-    4. drop rows by render expendability (status scaffolding first, worklog
-       tool/thinking rows last, oldest first within a role).
-
-    Returns the degraded scene with ``scene['truncated']`` recording what was
-    removed.
-    """
-    truncated = {}
-    for key in ("side_effects", "artifacts"):
-        if scene.get(key):
-            scene[key] = []
-            truncated.setdefault("dropped_outcomes", []).append(key)
-    if _anchor_scene_fits_size_cap(scene):
-        if truncated:
-            scene["truncated"] = truncated
-        return scene
-
-    deduped = 0
-    for row in scene.get("activity_rows") or []:
-        if isinstance(row, dict):
-            deduped += _anchor_scene_dedupe_row(row)
-    if deduped:
-        truncated["deduped_fields"] = deduped
-    if _anchor_scene_fits_size_cap(scene):
-        scene["truncated"] = truncated
-        return scene
-
-    clamped = [0]
-    budget = _ANCHOR_SCENE_FIELD_CLAMP_MAX_BYTES
-    while not _anchor_scene_fits_size_cap(scene) and budget >= _ANCHOR_SCENE_FIELD_CLAMP_MIN_BYTES:
-        _anchor_scene_clamp_long_strings(scene, budget, clamped)
-        budget //= 2
-    if clamped[0]:
-        truncated["clamped_fields"] = clamped[0]
-    if _anchor_scene_fits_size_cap(scene):
-        scene["truncated"] = truncated
-        return scene
-
-    rows = scene.get("activity_rows")
-    if isinstance(rows, list):
-        role_rank = {role: rank for rank, role in enumerate(_ANCHOR_SCENE_DROP_ROLE_ORDER)}
-        ranked = sorted(
-            range(len(rows)),
-            key=lambda i: (
-                role_rank.get(str((rows[i] or {}).get("role") or "activity"), 99)
-                if isinstance(rows[i], dict)
-                else 99,
-                i,
-            ),
-        )
-        dropped = 0
-        for i in ranked:
-            if _anchor_scene_fits_size_cap(scene):
-                break
-            rows[i] = None
-            dropped += 1
-        if dropped:
-            scene["activity_rows"] = [row for row in rows if row is not None]
-            truncated["dropped_rows"] = dropped
-    if truncated:
-        scene["truncated"] = truncated
-    return scene
-
-
 def _sanitize_anchor_activity_scene(scene):
     if not isinstance(scene, dict):
         raise ValueError("scene must be an object")
@@ -4647,11 +4301,10 @@ def _sanitize_anchor_activity_scene(scene):
     if len(rows) > _ANCHOR_ACTIVITY_SCENE_MAX_ROWS:
         raise ValueError("scene.activity_rows is too large")
     scene_copy = copy.deepcopy(scene)
-    if not _anchor_scene_fits_size_cap(scene_copy):
-        scene_copy = _degrade_anchor_activity_scene(scene_copy)
-    if not _anchor_scene_fits_size_cap(scene_copy):
+    encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES:
         raise ValueError("scene payload is too large")
-    return json.loads(_anchor_scene_json_dumps(scene_copy).encode("utf-8"))
+    return json.loads(encoded.decode("utf-8"))
 
 
 def _anchor_scene_int_or_none(value):
@@ -5024,8 +4677,7 @@ def _anchor_scene_content_tool(part):
         "args": part.get("args"),
         "input": part.get("input"),
         "function": copy.deepcopy(part.get("function")) if isinstance(part.get("function"), dict) else None,
-        "command": part.get("command") or part.get("raw_command") or part.get("original_command"),
-        "display_command": part.get("display_command"),
+        "command": part.get("command") or part.get("raw_command") or part.get("original_command") or part.get("display_command"),
         "preview": part.get("preview") or part.get("summary"),
         "snippet": part.get("snippet") or part.get("result") or part.get("output"),
         "result": copy.deepcopy(part.get("result")),
@@ -6080,10 +5732,7 @@ def _handle_session_anchor_scene(handler, body):
             records = dict(ordered[-256:])
         s.anchor_activity_scenes = records
         s.save(touch_updated_at=False, skip_index=True)
-    payload = {"ok": True, "message_index": idx, "message_ref": ref}
-    if scene.get("truncated"):
-        payload["truncated"] = scene["truncated"]
-    return j(handler, payload)
+    return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
 def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False):
@@ -6270,6 +5919,8 @@ def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = Non
     current_messages = list(getattr(session, "messages", None) or [])
     if not sid:
         return current_messages
+    if _cancelled_journal_turn_owner(current_messages):
+        return reconciled_state_db_messages_for_session(session)
     profile = getattr(session, "profile", None)
     is_messaging = (
         _is_messaging_session_record(session)
@@ -6933,24 +6584,21 @@ def _ip_is_loopback_or_private(raw: str):
     return (True, bool(addr.is_loopback or addr.is_private))
 
 
-def _trusted_proxy_networks(include_loopback: bool = True):
+def _trusted_proxy_networks():
     """Networks whose socket peer is allowed to assert a forwarded client IP.
 
-    Loopback is trusted implicitly (the common same-host reverse-proxy
-    deployment) unless ``include_loopback`` is False. Operators fronting the
-    WebUI with a LAN/remote proxy add its address(es) via
-    HERMES_WEBUI_TRUSTED_PROXY_CIDRS (comma-separated CIDRs or bare IPs).
-    Malformed entries are skipped, never widening trust.
+    Loopback is ALWAYS trusted implicitly (the common same-host reverse-proxy
+    deployment). Operators fronting the WebUI with a LAN/remote proxy add its
+    address(es) via HERMES_WEBUI_TRUSTED_PROXY_CIDRS (comma-separated CIDRs or
+    bare IPs). Malformed entries are skipped, never widening trust.
     """
     import ipaddress
 
-    nets = []
-    if include_loopback:
-        nets = [
-            ipaddress.ip_network("127.0.0.0/8"),
-            ipaddress.ip_network("::1/128"),
-            ipaddress.ip_network("::ffff:127.0.0.0/104"),
-        ]
+    nets = [
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("::ffff:127.0.0.0/104"),
+    ]
     raw = os.getenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "") or ""
     for token in raw.replace(";", ",").split(","):
         token = token.strip()
@@ -7008,32 +6656,15 @@ def _raw_peer_is_trusted_proxy(handler) -> bool:
     return _ip_in_networks(addr, _trusted_proxy_networks())
 
 
-def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = True):
+def _forwarded_client_ip_from_trusted_proxy(handler):
     """Resolve the real client IP from a chain fronted by a trusted proxy.
 
     Precondition: the caller has verified the raw socket peer is a trusted proxy.
     Consumes ALL X-Forwarded-For values (across repeated headers), preserves wire
     order, walks RIGHT-TO-LEFT skipping hops that are themselves trusted-proxy
-    addresses, and returns the first non-trusted (i.e. real-client) hop. Both the
-    XFF walk's final candidate and the raw-peer fallback are validated with
-    ``ipaddress.ip_address`` and returned in canonical string form — never raw
-    header text.
-
-    ``consult_real_ip`` selects the no-XFF fallback:
-      * ``True`` (default, the plain master behaviour) falls back to ``X-Real-IP``
-        and then the raw peer. The local-origin gate, trusted-header SSO and other
-        consumers that predate #7863 keep exactly the resolution they had.
-      * ``False`` never reads ``X-Real-IP`` at all and goes straight to the raw
-        peer. This is the request-log path only: the structured log is a security
-        boundary (its ``forwarded_for`` feed fail2ban), and ``X-Real-IP`` is a
-        second client-writable header (nginx relays client-supplied values through
-        by default instead of overwriting it), so honoring it there would
-        reintroduce #7863 through a different header.
-
-    The XFF walk is identical either way — the right-most hop was appended by the
-    trusted peer itself, so it carries the same guarantee with or without the
-    fallback. Returns None when the chain is present-but-empty / malformed so
-    callers fail closed.
+    addresses, and returns the first non-trusted (i.e. real-client) hop. Falls
+    back to X-Real-IP, then the raw socket peer. Returns None when the chain is
+    present-but-empty / malformed so the caller fails closed.
     """
     import ipaddress
 
@@ -7067,227 +6698,22 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
                 # rather than skip past it (an attacker could inject blanks).
                 return None
             try:
-                addr = ipaddress.ip_address(hop)
+                ipaddress.ip_address(hop)
             except ValueError:
                 # Non-IP token in the chain → malformed → fail closed.
                 return None
             if _is_trusted_hop(hop):
                 continue
-            # Final candidate: canonicalize to its validated string form so the
-            # log's forwarded_for is a normalised address, not raw header text.
-            return str(addr)
+            return hop
         # Every hop was a trusted proxy → no distinct client; treat as the proxy
         # tier itself (loopback/private), i.e. resolve to the raw peer below.
         return _request_client_ip(handler)
 
-    # No X-Forwarded-For at all.
-    if consult_real_ip:
-        # Master behaviour, kept for the pre-#7863 consumers (local-origin
-        # gate, trusted-header SSO): a proxy that asserts X-Real-IP is honoured.
-        real_ip = handler.headers.get("X-Real-IP", "").strip()
-        if real_ip:
-            return real_ip
-    # Without a forwarded chain the trusted proxy is speaking for itself. On the
-    # request-log path (consult_real_ip=False) this is also the fail-closed
-    # fallback: no forwarded chain, no forwarded identity.
+    real_ip = handler.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+    # No forwarded header at all → the trusted proxy is speaking for itself.
     return _request_client_ip(handler)
-
-
-_FORWARDED_HEADER_IGNORED_WARNED = False
-
-
-def _has_forwarded_header(handler) -> bool:
-    """True when the request carries a non-blank ``X-Forwarded-For``.
-
-    #7864 round 4 (nesquena-hermes review): the one-shot operator warning is
-    process-wide, so it must be spent on the case it exists to explain — an
-    ``X-Forwarded-For`` that the request log stopped recording. That is the
-    ONLY header the log ever recorded, so it is the only one whose loss needs
-    announcing. Counting ``X-Real-IP`` here let a stray client, scanner or
-    misconfigured LB carrying only that header burn the single warning (and
-    mislabel it: no X-Forwarded-For was ever sent) while the operator's real
-    proxy request stayed silent. This path resolves with
-    ``consult_real_ip=False`` and never consults ``X-Real-IP`` at all, so the
-    header is not a signal for anything on the log path.
-
-    Repeated ``X-Forwarded-For`` headers all count (``get_all``), matching the
-    consumption in ``_forwarded_client_ip_from_trusted_proxy``: a proxy that
-    splits the chain across two headers has still lost the field, and the
-    resolver reads every one of them.
-
-    Presence check only — the value is never read, returned or logged here:
-    it is attacker-controlled text and this module must stay a
-    non-log-writing consumer of it.
-    """
-    try:
-        values = handler.headers.get_all("X-Forwarded-For") or []
-    except AttributeError:
-        # Test/lightweight handlers expose a plain mapping without get_all.
-        try:
-            single = handler.headers.get("X-Forwarded-For", "")
-        except AttributeError:
-            return False
-        values = [single] if single else []
-    for value in values:
-        if str(value or "").strip():
-            return True
-    return False
-
-
-def _warn_forwarded_header_ignored(handler) -> None:
-    """Emit ONE process-wide warning when an ``X-Forwarded-For`` is ignored.
-
-    #7864 round 3 (nesquena-hermes review): ignoring the untrusted header is
-    the correct security behaviour, but on the default deployment a reverse
-    proxy on a Docker bridge or a LAN address is NOT an allowlisted trusted
-    proxy — so ``forwarded_for`` silently disappears from the request log and a
-    fail2ban jail keyed on it stops matching with nothing in the log saying
-    why. The behaviour change is right; the silence is the bug.
-
-    So warn — but only once per process (rate-limited by construction) and
-    never echo the untrusted header value itself: it is attacker-controlled
-    text, and writing it to the log would be an unbounded log-write vector.
-    Name the peer address and the fix (``HERMES_WEBUI_TRUSTED_PROXY_CIDRS``,
-    plus ``HERMES_WEBUI_TRUST_FORWARDED_FOR`` when unset) instead.
-    """
-    global _FORWARDED_HEADER_IGNORED_WARNED
-    if _FORWARDED_HEADER_IGNORED_WARNED:
-        return
-    _FORWARDED_HEADER_IGNORED_WARNED = True
-    peer = _request_client_ip(handler) or "unknown"
-    trust_forwarded = _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR")
-    cure = "HERMES_WEBUI_TRUSTED_PROXY_CIDRS"
-    if not trust_forwarded:
-        cure = (
-            "HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and "
-            "HERMES_WEBUI_TRUSTED_PROXY_CIDRS"
-        )
-    logger.warning(
-        "[webui] request-log: an X-Forwarded-For header from peer %s was "
-        "ignored (the header is not recorded). The peer is not a trusted "
-        "proxy, so the request log records no forwarded_for field for it. If "
-        "a proxy on this path should supply the client IP, add the peer "
-        "address to %s.",
-        peer,
-        cure,
-    )
-
-
-def request_log_forwarded_fields(handler) -> dict:
-    """Per-request log fields describing what the log did with X-Forwarded-For.
-
-    #7864 round 5 (nesquena-hermes review): the one-shot operator warning is
-    PROCESS-WIDE, so it can only ever explain ONE peer. On an exposed instance
-    any internet client can send its own ``X-Forwarded-For`` and spend it on
-    the first random request; the operator's unallowlisted proxy — the request
-    whose ``forwarded_for`` field actually disappeared — is then never named.
-    One warning line structurally cannot carry that.
-
-    So the warning stays, AND every structured record that dropped an XFF
-    carries ``forwarded_for_ignored: true``. A fail2ban jail or log query can
-    then see exactly which requests lost the field, per request.
-
-    CONTRACT:
-    * the value is a BOOLEAN signal only — the untrusted header text is never
-      read, returned or logged (attacker-controlled, and echoing it would be an
-      unbounded log-write vector). There is deliberately no way to recover the
-      dropped value from this module.
-    * ``forwarded_for`` is present (a validated client address) only when the
-      raw peer is a trusted proxy and the chain resolved; ``forwarded_for_ignored``
-      is present only when a non-blank XFF was seen and NOT recorded. They are
-      mutually exclusive: a resolved field is never also flagged as ignored.
-    * a direct client with no forwarded header gets NEITHER key, so the common
-      case stays byte-identical to master's log line.
-
-    Lives here (not inline in server.py) to keep the entrypoint under its
-    760-line guard — see tests/test_sprint10.py.
-    """
-    remote = _request_client_ip(handler)
-    if not _raw_peer_is_trusted_proxy(handler):
-        # #7864 round 3: an untrusted peer's forwarded header is ignored — the
-        # correct fail-closed outcome, but on the default deployment (a proxy
-        # on a Docker bridge / LAN address) it silently drops the log's
-        # forwarded_for field. Warn once per process so an operator whose
-        # fail2ban jail stops matching can see why; flag the record so the
-        # other peers that lose the field are still visible per request.
-        if not _has_forwarded_header(handler):
-            return {}
-        _warn_forwarded_header_ignored(handler)
-        return {"forwarded_for_ignored": True}
-    resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
-    if resolved and resolved != remote:
-        return {"forwarded_for": resolved}
-    return {}
-
-
-def trusted_forwarded_client_ip(handler) -> str | None:
-    """Resolved, validated client IP for the request log, or None.
-
-    Thin wrapper over :func:`request_log_forwarded_fields` for callers that
-    only want the address. ``log_request`` uses the dict form so a dropped
-    XFF is visible per request (#7864 round 5).
-
-    #7863: the structured request log must never record a spoofable client IP.
-    The left-most X-Forwarded-For hop is attacker-controlled, so a forwarded IP
-    is asserted only when the RAW socket peer is a trusted proxy (loopback or
-    allowlisted); the chain then resolves right-to-left. Direct clients fail
-    closed (no field at all), and a resolution that merely echoes the raw peer
-    is suppressed as redundant.
-
-    CONTRACT: the value written to the log's ``forwarded_for`` field is a
-    resolved, validated client address — canonical (``ipaddress.ip_address``
-    string form), NOT the raw left-most header text. It is derived
-    EXCLUSIVELY from the right-to-left X-Forwarded-For resolution: this path
-    resolves with ``consult_real_ip=False``, so the log never reads
-    ``X-Real-IP`` (any client can send it, and nginx relays it through by
-    default), and a trusted peer cannot smuggle an arbitrary address into the
-    log through that header, nor through any header-only path at all.
-    Malformed/incomplete XFF chains yield None (field omitted), so downstream
-    fail2ban-style consumers never see unvalidated or syntactically-invalid data.
-
-    Scope note: the XFF-only rule above is a property of THIS request-log
-    boundary, deliberately narrower than the shared resolver's default. Other
-    consumers (the local-origin gate, trusted-header auth) keep master's
-    ``X-Real-IP`` fallback via the default ``consult_real_ip=True``.
-
-    Kept here (not inline in server.py) so the process entrypoint stays under
-    its line guard — see tests/test_sprint10.py.
-    """
-    return request_log_forwarded_fields(handler).get("forwarded_for")
-
-
-def _login_client_ip(handler) -> str:
-    """Client IP that the login rate limiter keys on.
-
-    Behind a reverse proxy the raw socket peer is the proxy, so every user
-    would share one bucket. Consult the forwarded chain only when
-    HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and the raw peer is listed in
-    HERMES_WEBUI_TRUSTED_PROXY_CIDRS. Implicit loopback trust is not enough:
-    a direct loopback or SSH-tunnel client could otherwise send a new
-    X-Forwarded-For on every attempt. Listing a loopback address in
-    HERMES_WEBUI_TRUSTED_PROXY_CIDRS trusts every local client (an SSH tunnel,
-    another local process) exactly like the proxy, because the address cannot
-    tell a same-host proxy from a same-host client.
-
-    When both X-Forwarded-For and X-Real-IP are present they must resolve to the
-    same address. Otherwise the proxy is passing the client's own
-    X-Forwarded-For through and the client could pick its bucket. Fall back to
-    the raw peer whenever they differ or a value is not an IP address.
-    """
-    import ipaddress
-
-    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR"):
-        try:
-            peer = ipaddress.ip_address(_request_client_ip(handler))
-            if _ip_in_networks(peer, _trusted_proxy_networks(include_loopback=False)):
-                client = ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler))
-                xff = handler.headers.get("X-Forwarded-For")
-                real_ip = handler.headers.get("X-Real-IP", "").strip()
-                if not (xff and real_ip) or client == ipaddress.ip_address(real_ip):
-                    return str(client)
-        except ValueError:
-            pass
-    return _client_ip_for_rate_limit(handler)
 
 
 def _onboarding_request_is_local(handler) -> bool:
@@ -9331,238 +8757,6 @@ def _is_subagent_child_session_id(sid: str) -> bool:
     return _state_db_session_source(sid) == "subagent"
 
 
-# ── Composer-draft save coalescing (issue #7839, gate redesign) ──────────────
-# On very large sessions one Session.save() serializes the whole transcript
-# behind the per-session agent lock (seconds per save). Naively queueing
-# debounced draft POSTs therefore produces a lock convoy: every queued request
-# later performs its own full rewrite of the SAME payload and every other
-# endpoint for that session stalls behind the pile-up (measured: 21-182 s lock
-# waits, "Request timed out" toasts, chats appearing to vanish until refresh).
-#
-# Instead, every POST publishes its payload to a per-session state object and
-# waits on a generation-tagged settlement: exactly ONE worker per session
-# (claimed atomically under _DRAFT_CV) performs one save per distinct
-# payload, serialized with the same per-session agent lock as before.
-# Invariants (each pinned by tests, gate findings #7840):
-#   - A request returns 200 only after its generation — or a newer generation
-#     that supersedes it — is durably saved, and the response carries the
-#     actual durable draft (not the request fields).
-#   - Settlements are never reset by later requests, so a failed save can
-#     never surface as a later false ok:true.
-#   - Eviction is identity-checked; a retiring worker can never drop a newer
-#     state that holds a fresher request's intent.
-#   - Every load failure settles (never strands the owner), a missing session
-#     settles as 404, and a bounded self-heal timer respawns a retired worker
-#     so a queued intent becomes durable even if no further request arrives
-#     (the pre-coalescing code waited synchronously and always saved).
-_DRAFT_COALESCE = {}
-_DRAFT_CV = threading.Condition()
-_DRAFT_SAVE_LOCK_WAIT = 20.0
-_DRAFT_SAVE_REQUEST_WAIT = 30.0
-_DRAFT_SAVE_RETRY_DELAY = 5.0
-_DRAFT_SAVE_MAX_RETRIES = 12
-
-
-class _DraftSaveIntent:
-
-    __slots__ = ("text", "files")
-
-    def __init__(self, text=None, files=None):
-        self.text = text
-        self.files = files
-
-
-class _DraftSaveState:
-
-    __slots__ = (
-        "pending", "published", "published_gen", "generation",
-        "owner_alive", "outcomes", "retries",
-    )
-
-    def __init__(self):
-        self.pending = None            # newest intent not yet picked up
-        self.published = None          # intent the worker is saving
-        self.published_gen = 0
-        self.generation = 0            # monotonic; newest queued/published gen
-        self.owner_alive = False       # a worker owns this state right now
-        # Per-generation settlements: gen -> (outcome, unchanged, durable).
-        # A request reads ONLY its own entry — or a newer "ok" that superseded
-        # it — so a later failure can never flip an earlier success into a
-        # false 503, and an earlier failure can never produce a false ok:true.
-        self.outcomes = {}
-        self.retries = 0               # consecutive retryable failures
-
-
-def _maybe_spawn_draft_worker(sid, state):
-    """Claim + start the worker for `state` if it is retired but work remains.
-
-    MUST be called while holding _DRAFT_CV: the owner claim is atomic with the
-    pending check, so two concurrent POSTs can never both start a worker.
-    """
-    if _DRAFT_COALESCE.get(sid) is not state:
-        return
-    if state.owner_alive:
-        return
-    if state.pending is None and state.published is None:
-        return
-    state.owner_alive = True
-    threading.Thread(
-        target=_draft_save_worker,
-        args=(sid,),
-        name=f"draft-save-{sid}",
-        daemon=True,
-    ).start()
-
-
-def _draft_save_retry_wake(sid, state):
-    """Self-heal: respawn the worker for a requeued intent after a failure."""
-    with _DRAFT_CV:
-        if _DRAFT_COALESCE.get(sid) is not state:
-            return
-        if state.owner_alive or (state.pending is None and state.published is None):
-            return
-        state.owner_alive = True
-    threading.Thread(
-        target=_draft_save_worker,
-        args=(sid,),
-        name=f"draft-save-{sid}",
-        daemon=True,
-    ).start()
-
-
-def _draft_save_worker(sid):
-    """Persist queued draft intents for `sid`; one save per distinct payload.
-
-    Owns `state.published` between CV windows. Every exit path settles the
-    waiters (notify_all under _DRAFT_CV) and retires ownership atomically, so
-    a load failure can never strand later saves.
-    """
-    while True:
-        with _DRAFT_CV:
-            state = _DRAFT_COALESCE.get(sid)
-            if state is None or (state.pending is None and state.published is None):
-                if state is not None and _DRAFT_COALESCE.get(sid) is state:
-                    state.owner_alive = False
-                    _DRAFT_COALESCE.pop(sid, None)
-                    _DRAFT_CV.notify_all()
-                return
-            if state.pending is not None:
-                state.published = state.pending
-                state.published_gen = state.generation
-                state.pending = None
-            intent = state.published
-            gen = state.published_gen
-
-        missing = False
-        failed = False
-        unchanged_flag = False
-        durable = None
-        acquired = False
-        s = None
-        try:
-            s = get_session(sid)
-        except KeyError:
-            missing = True
-        except Exception:
-            failed = True
-            logger.exception("Draft save worker failed to load session %s", sid)
-        if s is not None and getattr(s, "_loaded_metadata_only", False):
-            # Never save a metadata-only stub (#1558); upgrade to full load.
-            try:
-                from api.models import Session as _Session
-                s = _Session.load(sid)
-            except Exception:
-                logger.exception("Draft save worker failed to load session %s", sid)
-            if s is None:
-                missing = True
-        if not missing and not failed and s is not None:
-            lock = _get_session_agent_lock(sid)
-            try:
-                acquired = lock.acquire(timeout=_DRAFT_SAVE_LOCK_WAIT)
-                if not acquired:
-                    # Bounded wait expired (a very large save or another heavy
-                    # operation holds the lock): retryable failure.
-                    failed = True
-                else:
-                    current_draft = dict(getattr(s, "composer_draft", {}) or {})
-                    next_draft = dict(current_draft)
-                    if intent.text is not None:
-                        next_draft["text"] = intent.text
-                    if intent.files is not None:
-                        next_draft["files"] = intent.files
-                    if next_draft == current_draft:
-                        unchanged_flag = True
-                        durable = current_draft
-                    else:
-                        s.composer_draft = next_draft
-                        # Draft persistence is not conversation activity. Touching updated_at
-                        # here makes the active-session external-refresh poll force-reload the
-                        # current chat every few seconds while the user is typing, and that
-                        # delayed reload can restore an older draft over newer local input.
-                        s.save(touch_updated_at=False, skip_index=True)
-                        durable = next_draft
-            except Exception:
-                failed = True
-                logger.exception("Draft save worker failed for session %s", sid)
-            finally:
-                if acquired:
-                    lock.release()
-
-        with _DRAFT_CV:
-            state = _DRAFT_COALESCE.get(sid)
-            if state is None:
-                # The state was removed while we saved; nothing to settle —
-                # a newer owner owns the session now.
-                return
-            if state.published is intent:
-                state.published = None
-            outcome = "missing" if missing else ("failed" if failed else "ok")
-            state.outcomes[gen] = (outcome, unchanged_flag, durable)
-            if len(state.outcomes) > 64:
-                for old_gen in sorted(state.outcomes)[: len(state.outcomes) - 64]:
-                    del state.outcomes[old_gen]
-            if outcome == "ok":
-                state.retries = 0
-                if state.pending is None:
-                    state.owner_alive = False
-                    if _DRAFT_COALESCE.get(sid) is state:
-                        _DRAFT_COALESCE.pop(sid, None)
-                    _DRAFT_CV.notify_all()
-                    return
-                # A newer intent is queued: keep ownership, save it next loop.
-                _DRAFT_CV.notify_all()
-                continue
-            if outcome == "missing":
-                # The session vanished mid-flight (deleted after the request's
-                # preflight). Nothing can be saved onto it; settle honestly
-                # and drop the intent — retrying cannot resurrect the session.
-                state.pending = None
-                state.owner_alive = False
-                _DRAFT_CV.notify_all()
-                if _DRAFT_COALESCE.get(sid) is state:
-                    _DRAFT_COALESCE.pop(sid, None)
-                return
-            # Retryable failure (lock wait expired or save raised): keep the
-            # newest queued intent so the next request — or the bounded
-            # self-heal timer — can persist it, but retire THIS worker so a
-            # persistent failure cannot retry-spin. The settlement stays
-            # readable for its waiters (never reset by later publishes).
-            if state.pending is None:
-                state.pending = intent
-            state.retries += 1
-            state.owner_alive = False
-            _DRAFT_CV.notify_all()
-            if state.retries <= _DRAFT_SAVE_MAX_RETRIES:
-                timer = threading.Timer(
-                    _DRAFT_SAVE_RETRY_DELAY,
-                    _draft_save_retry_wake,
-                    args=(sid, state),
-                )
-                timer.daemon = True
-                timer.start()
-            return
-
-
 def _session_is_subagent_view_only(sid: str) -> bool:
     """Return True when ``sid`` is a delegated subagent child by ANY signal —
     state.db source OR a persisted WebUI sidecar tagged subagent.
@@ -9801,16 +8995,9 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             import sqlite3 as _sqlite
             with closing(_sqlite.connect(str(db_path))) as _conn:
                 _conn.row_factory = _sqlite.Row
-                # Older state.db schemas lack parent_session_id; select NULL
-                # so source/title/model classification still works.
-                _cols = {r[1] for r in _conn.execute("PRAGMA table_info(sessions)")}
-                _parent_expr = (
-                    "parent_session_id" if "parent_session_id" in _cols
-                    else "NULL AS parent_session_id"
-                )
                 _row = _conn.execute(
-                    "SELECT source, title, model, cwd, started_at, ended_at, "
-                    f"{_parent_expr} FROM sessions WHERE id = ?", (sid,)
+                    "SELECT source, title, model, cwd, started_at, ended_at "
+                    "FROM sessions WHERE id = ?", (sid,)
                 ).fetchone()
                 if _row is not None:
                     state_db_row = dict(_row)
@@ -9861,18 +9048,6 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             if _ended or _started:
                 cli_meta["updated_at"] = _ended or _started
     claimable, _reason = _is_claimable_cli_source(cli_meta, state_db_source)
-    # A separate WebUI can project live profile state.db files while keeping
-    # its own sidecar store isolated. Existing CLI/TUI/Desktop rows are
-    # normally claimable, which materializes SESSION_DIR/<sid>.json on first
-    # open. That flat key is not profile-qualified and can collide across
-    # profile databases. The operator flag turns every foreign state.db row
-    # into a synthetic view-only Session. New WebUI sessions remain writable
-    # because they never enter this materialization path.
-    if str(os.getenv("HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY", "")).strip().lower() in {
-        "1", "true", "yes", "on",
-    }:
-        claimable = False
-        _reason = "operator_read_only"
     if not claimable:
         # The session is real and viewable, but the foreign source forbids
         # the WebUI from taking write ownership.  Build the Session with
@@ -9887,16 +9062,11 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         # keeps narrow. Every other non-claimable foreign source keeps the
         # CLI classification so its source badge renders.
         _sa_child = _is_subagent_child_session_id(sid)
-        session = build_session(sid, cli_meta, msgs, read_only_flag=True,
-                                is_cli_flag=not _sa_child)
-        if _sa_child and state_db_row:
-            # Delegated child lineage and lifecycle come from its state.db row;
-            # ended_at is set by the delegate runner when the child finishes.
-            parent_sid = str(state_db_row.get("parent_session_id") or "").strip()
-            session.parent_session_id = parent_sid or None
-            session.relationship_type = "child_session" if parent_sid else None
-            session.active = "ended_at" in state_db_row and state_db_row["ended_at"] is None
-        return session, "not_claimable"
+        return (
+            build_session(sid, cli_meta, msgs, read_only_flag=True,
+                          is_cli_flag=not _sa_child),
+            "not_claimable",
+        )
     return build_session(sid, cli_meta, msgs, read_only_flag=False), "materialized"
 
 
@@ -10172,14 +9342,8 @@ def _message_counts_as_renderable_for_window(message) -> bool:
     to keep thinking/tool details inspectable, but they are not reply text. A
     tail page containing only transient metadata makes the frontend open to
     collapsed activity while newer real replies sit behind "load older messages".
-    Hidden internal rows (``delegation_wakeup``) are retained in storage for
-    model/recovery state but are never renderable, so they cannot consume the
-    visible-row budget — otherwise the 30-row restore window can be all-hidden
-    and the transcript opens blank (#quiet-delegation gate review).
     """
     if not isinstance(message, dict):
-        return False
-    if is_hidden_transcript_row(message):
         return False
     if _is_empty_partial_activity_message(message):
         return False
@@ -10371,6 +9535,7 @@ def _state_db_backstop_limit_for_display(session, msg_before) -> int | None:
         msg_before is not None
         or getattr(session, "truncation_watermark", None) not in (None, "")
         or getattr(session, "truncation_boundary", None) not in (None, "")
+        or _cancelled_journal_turn_owner(getattr(session, "messages", None) or []) is not None
     )
     return None if has_boundary_prefix else _STATE_DB_DISPLAY_ROW_BACKSTOP
 
@@ -10455,7 +9620,43 @@ def _display_merge_session_is_active(session) -> bool:
     )
 
 
-def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None):
+def _display_exact_owner_positions(session, messages):
+    """Map saved row positions before display/cache copies lose object identity."""
+    projected = {id(row): index for index, row in enumerate(messages)}
+    return {
+        index: projected[id(row)]
+        for index, row in enumerate(getattr(session, "messages", None) or [])
+        if id(row) in projected
+    }
+
+
+def _display_projected_owner_positions(source_messages, messages, source_owners):
+    """Compose saved-to-source positions with an exact-object display projection."""
+    projected = {id(row): index for index, row in enumerate(messages)}
+    return {
+        owner: projected[id(source_messages[index])]
+        for owner, index in source_owners.items()
+        if 0 <= index < len(source_messages) and id(source_messages[index]) in projected
+    }
+
+
+def _display_rebased_tool_calls(tool_calls, owner_positions):
+    """Project cards onto proven owners without changing persisted metadata."""
+    projected = []
+    for card in tool_calls or []:
+        if not isinstance(card, dict):
+            projected.append(card)
+            continue
+        owner = card.get("assistant_msg_idx")
+        if type(owner) is int:
+            if owner not in owner_positions:
+                continue
+            card = dict(card, assistant_msg_idx=owner_positions[owner])
+        projected.append(card)
+    return projected
+
+
+def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None, owner_positions=None):
     """Return the memoized merged transcript, or None when it can't be reused.
 
     Lets GET /api/session skip loading the state.db rows entirely on a hit. That
@@ -10495,6 +9696,11 @@ def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None
         entry = _display_merge_cache.get(sid)
         if not _display_merge_cache_entry_usable(entry, cache_key):
             return None
+        if owner_positions is not None:
+            if "owner_positions" not in entry:
+                return None
+            owner_positions.clear()
+            owner_positions.update(entry["owner_positions"])
         _display_merge_cache.move_to_end(sid, last=True)
         return [dict(m) if isinstance(m, dict) else m for m in entry["messages"]]
 
@@ -10509,26 +9715,32 @@ def _limited_webui_messages_for_display_with_sidecar(
     *,
     state_db_signature=_DISPLAY_STATE_SIGNATURE_UNSET,
     msg_before=None,
+    owner_positions=None,
 ) -> list:
+    sidecar_owners = dict(owner_positions or {})
     if sidecar_messages is None:
-        sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
+        sidecar_owners = {}
+        sidecar_messages = _webui_sidecar_lineage_messages_for_display(
+            session, owner_positions=sidecar_owners,
+        )
     else:
         sidecar_messages = list(sidecar_messages or [])
+        if not sidecar_owners:
+            sidecar_owners = _display_exact_owner_positions(session, sidecar_messages)
     state_db_messages = list(state_db_messages or [])
     if not state_db_messages:
+        if owner_positions is not None:
+            owner_positions.clear()
+            owner_positions.update(sidecar_owners)
         return sidecar_messages
     state_db_messages = _suppress_native_image_display_mirrors(
         session,
         state_db_messages,
     )
-    # #quiet-delegation: stamp pending-turn provenance here too, so the
-    # paginated (msg_limit) load path matches the full-load path's behaviour
-    # during the deferred-save window.
-    state_db_messages = _stamp_pending_source_for_display(
-        session,
-        state_db_messages,
-    )
     if not state_db_messages:
+        if owner_positions is not None:
+            owner_positions.clear()
+            owner_positions.update(sidecar_owners)
         return sidecar_messages
 
     # NOTE: do not short-circuit to the sidecar when state.db has no strictly
@@ -10581,7 +9793,11 @@ def _limited_webui_messages_for_display_with_sidecar(
         sid = str(getattr(session, "session_id", "") or "")
         with _display_merge_cache_lock:
             entry = _display_merge_cache.get(sid)
-            if _display_merge_cache_entry_usable(entry, cache_key):
+            if (_display_merge_cache_entry_usable(entry, cache_key)
+                    and (owner_positions is None or "owner_positions" in entry)):
+                if owner_positions is not None:
+                    owner_positions.clear()
+                    owner_positions.update(entry["owner_positions"])
                 _display_merge_cache.move_to_end(sid, last=True)
                 return [dict(m) if isinstance(m, dict) else m for m in entry["messages"]]
     merged = merge_session_messages_append_only(
@@ -10590,12 +9806,17 @@ def _limited_webui_messages_for_display_with_sidecar(
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
         incoming_provenance="state_db",
+        cancelled_journal_owner_messages=getattr(session, "messages", None) or [],
     )
     merged = _project_native_image_payload_conflicts_for_display(
         sidecar_messages,
         state_db_messages,
         merged,
     )
+    projected_owners = _display_projected_owner_positions(sidecar_messages, merged, sidecar_owners)
+    if owner_positions is not None:
+        owner_positions.clear()
+        owner_positions.update(projected_owners)
     if cache_key is not None:
         _state_key = cache_key[4]
         _streaming_key = (
@@ -10619,6 +9840,7 @@ def _limited_webui_messages_for_display_with_sidecar(
             _display_merge_cache[sid] = {
                 "key": cache_key,
                 "messages": merged,
+                "owner_positions": projected_owners,
                 "stored_at": time.monotonic(),
             }
             _display_merge_cache.move_to_end(sid, last=True)
@@ -11022,7 +10244,7 @@ def _sidecar_file_exceeds_threshold(session_id, threshold_bytes) -> bool:
         return False
 
 
-def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before=None):
+def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before=None, *, owner_positions=None):
     """Return (timestamp floor, sidecar messages) for bounded state.db tail reads.
 
     The display window limit counts visible transcript rows after WebUI sidecar
@@ -11038,8 +10260,10 @@ def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before
         return None, None
     if getattr(session, "truncation_boundary", None) not in (None, ""):
         return None, None
+    if _cancelled_journal_turn_owner(getattr(session, "messages", None) or []):
+        return None, None  # The exact cancelled owner is needed before slicing.
 
-    sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
+    sidecar_messages = _webui_sidecar_lineage_messages_for_display(session, owner_positions=owner_positions)
     if not sidecar_messages:
         return None, sidecar_messages
     sidecar_timestamps = [_message_timestamp_as_float(msg) for msg in sidecar_messages]
@@ -11117,7 +10341,7 @@ _lineage_display_cache: "OrderedDict[str, dict]" = OrderedDict()
 _lineage_display_cache_lock = threading.Lock()
 
 
-def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) -> list:
+def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20, owner_positions=None) -> list:
     """Return WebUI sidecar messages stitched across compression snapshots.
 
     WebUI compression continuations persist the archived transcript in a parent
@@ -11149,6 +10373,7 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
             entry is not None
             and entry.get("provenance_complete") is True
             and entry.get("self_sig") == self_sig
+            and (owner_positions is None or "owner_positions" in entry)
         ):
             stale = False
             for parent_path, parent_sig in entry.get("parent_sigs") or []:
@@ -11160,6 +10385,9 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
                     current_entry = _lineage_display_cache.get(sid)
                     if current_entry is entry:
                         _lineage_display_cache.move_to_end(sid, last=True)
+                        if owner_positions is not None:
+                            owner_positions.clear()
+                            owner_positions.update(entry["owner_positions"])
                         return [
                             dict(m) if isinstance(m, dict) else m
                             for m in entry["messages"]
@@ -11206,6 +10434,9 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
             session_messages,
             getattr(parent, "messages", []) or [],
         ):
+            if owner_positions is not None:
+                owner_positions.clear()
+                owner_positions.update(_display_exact_owner_positions(session, session_messages))
             return session_messages
         segments.append(parent)
         seen.add(parent_id)
@@ -11216,7 +10447,10 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
         parent_signatures_complete = False
 
     if not segments:
-        return list(getattr(session, "messages", []) or [])
+        if owner_positions is not None:
+            owner_positions.clear()
+            owner_positions.update(_display_exact_owner_positions(session, session_messages))
+        return session_messages
 
     merged = []
     for segment in reversed(segments):
@@ -11231,6 +10465,10 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
         getattr(session, "messages", []) or [],
         truncation_watermark=None,
     )
+    projected_owners = _display_exact_owner_positions(session, merged)
+    if owner_positions is not None:
+        owner_positions.clear()
+        owner_positions.update(projected_owners)
     if (
         cache_allowed
         and self_sig is not None
@@ -11243,6 +10481,7 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
                 "parent_sigs": parent_sigs,
                 "provenance_complete": True,
                 "messages": merged,
+                "owner_positions": projected_owners,
             }
             _lineage_display_cache.move_to_end(sid, last=True)
             while len(_lineage_display_cache) > _LINEAGE_DISPLAY_CACHE_MAX:
@@ -11962,8 +11201,6 @@ from api.models import (
     load_projects,
     save_projects,
     import_cli_session,
-    stage_session_sidecar,
-    publish_staged_session_sidecar,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
     get_cli_session_messages,
@@ -11972,9 +11209,11 @@ from api.models import (
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     merge_session_messages_append_only,
+    reconciled_state_db_messages_for_session,
+    _cancelled_journal_turn_owner,
+    _reindex_tool_owners_after_message_reorder,
     _project_native_image_payload_conflicts_for_display,
     _suppress_native_image_display_mirrors,
-    _stamp_pending_source_for_display,
     _reconcile_api_content_sidecars,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
@@ -14146,78 +13385,6 @@ def _get_plugin_manager_for_visibility():
     return get_plugin_manager()
 
 
-def _list_plugin_skills_for_response(manager=None) -> list:
-    """Return plugin-registered skills formatted for the WebUI skill listing.
-
-    Each entry is a dict with the same shape as a local-skill entry plus a
-    ``source`` marker (``"plugin"``) and the ``plugin`` namespace, so the UI can
-    group/label them distinctly while reusing the existing skill-row rendering
-    path. The qualified ``name`` (``plugin_namespace:skill``) is preserved so
-    the slash-command autocomplete can round-trip it losslessly (#7770).
-
-    Isolated WebUI deployments (no Hermes Agent import path) MUST NOT crash;
-    every failure path returns an empty list and lets the directory-based
-    listing proceed unchanged. The same fail-soft posture as
-    ``_get_plugin_manager_for_visibility`` and the existing plugin-skill
-    content-lookup branch around L1140-1150.
-    """
-    try:
-        from agent.skill_utils import is_valid_namespace, parse_qualified_name
-    except Exception:
-        return []
-    try:
-        pm = manager if manager is not None else _get_plugin_manager_for_visibility()
-    except Exception:
-        return []
-    # Mirror ``_plugin_visibility_payload`` at api/routes.py:12885: a fresh
-    # WebUI process that has not yet driven an agent turn (or opened the
-    # Settings → Plugins tab) sits on an empty ``_plugin_skills`` registry
-    # because the agent's contract only populates it during discovery. The
-    # visibility panel therefore explicitly calls
-    # ``manager.discover_and_load(force=False)`` before reading the registry.
-    # /api/skills must do the same so a cold-start tab does not silently drop
-    # plugin-registered skills (e.g. obra/superpowers) from both the listing
-    # AND the slash-command autocomplete (#7770). The call is best-effort: a
-    # discovery failure must not 500 /api/skills — the same fail-soft posture
-    # the rest of this helper already enforces.
-    try:
-        pm.discover_and_load(force=False)
-    except Exception:
-        pass
-    try:
-        entries = pm.list_plugin_skill_metadata() or []
-    except Exception:
-        return []
-    if not isinstance(entries, list):
-        return []
-    out: list = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        raw_name = str(entry.get("name", "") or "").strip()
-        if not raw_name:
-            continue
-        if ":" not in raw_name:
-            # Plugin-skill registry always uses the qualified form; an
-            # un-qualified name would be ambiguous against a local skill and
-            # is filtered out so it cannot leak into the picker.
-            continue
-        namespace, bare = parse_qualified_name(raw_name)
-        if not is_valid_namespace(namespace) or not bare:
-            continue
-        out.append(
-            {
-                "name": raw_name,
-                "description": str(entry.get("description", "") or "").strip(),
-                "category": "plugin",
-                "plugin": namespace,
-                "source": "plugin",
-                "disabled": False,
-            }
-        )
-    return out
-
-
 def _clean_plugin_visibility_text(value, *, limit=240) -> str:
     """Return bounded display text without path/callback-like internals."""
     if value is None:
@@ -14589,174 +13756,6 @@ def _render_index_shell_base() -> str:
     return base
 
 
-# #7310 — generation-keyed single-flight for GET /api/session.
-#
-# A reconnect storm fans out N identical session reloads at the same instant
-# (one refetch per dropped socket, plus one per live stream). Each of them
-# re-read state.db, re-merge, re-compact(), re-run the regeneration authority
-# and re-redact the same window. That work is CPU-bound under the GIL, so the
-# burst costs N times a single read and the request threads stack up faster
-# than they drain — the multi-second /api/session stall reported in #7310.
-#
-# Coalescing contract (from #7310): only identical *public* projections may
-# share a result. The key below therefore carries everything the payload is
-# derived from — profile, pagination/window, truncation, active-stream
-# ownership and the CLI metadata merged into it — plus the on-disk generation
-# of every other input: the child sidecar stat signature and the session-scoped
-# state.db revision, the compression-snapshot parent sidecars that the lineage
-# stitch folds into the transcript, the run journal that supplies
-# ``runtime_journal``/``runtime_journal_snapshot``, and settings.json, which
-# drives redaction. Equal keys mean both requests observed the same bytes when
-# they arrived, so a follower receives exactly the snapshot it would have built
-# itself; nothing is reused after the in-flight window closes, and only the
-# finished redacted payload is ever published (never an unredacted
-# intermediate).
-_SESSION_GET_FLIGHTS: dict = {}
-_SESSION_GET_FLIGHT_LOCK = threading.Lock()
-# Longest a follower waits on its leader before building the projection
-# itself, so one wedged leader can never park N request threads on an event
-# nobody will set.
-_SESSION_GET_FLIGHT_WAIT_SECONDS = 30.0
-
-
-def _session_get_lineage_token(session, sidecar_sig):
-    """Stat generation of every sidecar stitched into this session's transcript.
-
-    ``_webui_sidecar_lineage_messages_for_display`` walks compression-snapshot
-    parents and their messages reach the payload, so a flight may only be
-    shared while those parents are provably unchanged. The lineage display
-    cache already records the child signature plus every parent path and its
-    stat, which keeps this stat-only instead of re-parsing parent transcripts on
-    every reload. Returns ``None`` whenever the generation cannot be proven —
-    no coalescing rather than a stale transcript.
-    """
-    from api.models import _sidecar_stat_signature
-
-    if not str(getattr(session, "parent_session_id", "") or "").strip():
-        # No parent link: nothing outside this sidecar can be stitched in.
-        return ()
-    sid = str(getattr(session, "session_id", "") or "")
-    with _lineage_display_cache_lock:
-        entry = _lineage_display_cache.get(sid)
-        recorded_self = entry.get("self_sig") if entry else None
-        recorded_parents = entry.get("parent_sigs") if entry else None
-        provenance_complete = bool(entry and entry.get("provenance_complete"))
-    if (
-        not provenance_complete
-        or recorded_self != sidecar_sig
-        or recorded_parents is None
-    ):
-        # No verified record of the chain (cold or already stale): the lineage
-        # walk has not proven which parents contribute, so refuse to share.
-        return None
-    live = []
-    for parent_path, recorded_sig in recorded_parents:
-        current = _sidecar_stat_signature(Path(parent_path))
-        if current is None or current != recorded_sig:
-            return None
-        live.append((str(parent_path), current))
-    return tuple(live)
-
-
-def _session_get_flight_key(session, profile, cli_meta, query_shape):
-    """Return the identity of one identical concurrent GET /api/session read.
-
-    ``None`` disables coalescing for the request: every component must resolve
-    exactly, otherwise two requests that are not provably the same public
-    projection would share a result (#7310).
-    """
-    from api.models import _sidecar_stat_signature
-
-    sid = str(getattr(session, "session_id", "") or "")
-    if not sid or not is_safe_session_id(sid):
-        return None
-    sidecar_sig = _sidecar_stat_signature(SESSION_DIR / f"{sid}.json")
-    if sidecar_sig is None:
-        return None
-    state_sig = _state_db_session_signature(sid, profile)
-    if state_sig is None:
-        return None
-    if cli_meta:
-        # CLI/messaging sessions merge this index metadata straight into the
-        # payload, so it is part of the projection's identity as well.
-        try:
-            cli_sig = json.dumps(cli_meta, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            return None
-    else:
-        cli_sig = ""
-    lineage_token = _session_get_lineage_token(session, sidecar_sig)
-    if lineage_token is None:
-        return None
-    active_stream_id = str(getattr(session, "active_stream_id", "") or "")
-    journal_fp = session_journal_fingerprint(sid, session_dir=SESSION_DIR)
-    if active_stream_id and journal_fp == (0, 0.0, 0):
-        # The payload reads this run's journal, but its file is not under this
-        # session's journal directory — a fingerprint this cheap cannot see it,
-        # so refuse to share rather than assume it is frozen.
-        return None
-    try:
-        _settings_stat = SETTINGS_FILE.stat()
-        settings_sig = (_settings_stat.st_mtime_ns, _settings_stat.st_size)
-    except OSError:
-        # No settings.json at all: redaction runs on pure defaults, which is
-        # one well-defined generation.
-        settings_sig = ()
-    return (
-        sid,
-        profile,
-        query_shape,
-        sidecar_sig,
-        state_sig,
-        cli_sig,
-        lineage_token,
-        journal_fp,
-        settings_sig,
-        getattr(session, "active_stream_id", None),
-        bool(getattr(session, "pending_user_message", None)),
-        getattr(session, "truncation_watermark", None),
-        getattr(session, "truncation_boundary", None),
-    )
-
-
-def _claim_session_get_flight(key):
-    """Elect one leader per identical in-flight read.
-
-    Returns ``(is_leader, flight)``. A follower waits on ``flight`` instead of
-    rebuilding the same projection; the leader owns the registry entry until
-    ``_finish_session_get_flight`` releases it.
-    """
-    with _SESSION_GET_FLIGHT_LOCK:
-        flight = _SESSION_GET_FLIGHTS.get(key)
-        if flight is not None:
-            return False, flight
-        flight = {
-            "key": key,
-            "owner": threading.get_ident(),
-            "event": threading.Event(),
-            "payload": None,
-        }
-        _SESSION_GET_FLIGHTS[key] = flight
-        return True, flight
-
-
-def _finish_session_get_flight(flight) -> None:
-    """Release one flight: drop its entry and wake every waiter.
-
-    Ownership-checked so a follower that timed out and fell through to its own
-    computation can never evict a later leader's entry, and idempotent so the
-    publish step and the handler's ``finally`` may both call it. The payload
-    left on the flight is what waiters receive: ``None`` when the leader never
-    finished, which sends them down the normal path instead of hanging.
-    """
-    if flight is None:
-        return
-    with _SESSION_GET_FLIGHT_LOCK:
-        if _SESSION_GET_FLIGHTS.get(flight["key"]) is flight:
-            _SESSION_GET_FLIGHTS.pop(flight["key"], None)
-    flight["event"].set()
-
-
 def _handle_session_get(handler, parsed) -> bool:
     """GET /api/session — full session payload (messages, tool calls, lineage...). Extracted verbatim from handle_get; every early-return path calls _diag.finish() (see the tier2c note inside)."""
     import time as _time
@@ -14815,10 +13814,6 @@ def _handle_session_get(handler, parsed) -> bool:
     # the flag no longer changes the server-side pagination semantics.
     _expand_renderable = query.get("expand_renderable", [None])[0]
     expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
-    # #7310: declared before the try so the finally clause below can always
-    # release whatever flight this request ends up owning (None unless it
-    # claims leadership further down).
-    _session_get_flight = None
     try:
         _t1 = _time.monotonic()
         if _diag: _diag.stage("t1_after_get_session_check")
@@ -14856,47 +13851,9 @@ def _handle_session_get(handler, parsed) -> bool:
         # branch below, including the ones that never probe the cache.
         _display_cache_hit = None
         _display_state_db_signature = None
-        # #7310: identical concurrent reloads share one projection instead of
-        # each rebuilding the same window. The key is built from what THIS
-        # request observed (query shape, profile, stream ownership, sidecar and
-        # state.db generation), so a follower is handed the snapshot it would
-        # have built itself. A leader that fails leaves `payload` as None, so
-        # waiters fall through to the normal path rather than wait forever.
-        _session_get_query_shape = (
-            load_messages,
-            msg_limit,
-            msg_before,
-            expand_renderable,
-            resolve_model,
-            is_messaging_session,
-        )
-        _session_get_key = _session_get_flight_key(
-            s,
-            _session_profile,
-            cli_meta,
-            _session_get_query_shape,
-        )
-        if _session_get_key is not None:
-            _session_get_leader, _session_get_claim = _claim_session_get_flight(
-                _session_get_key
-            )
-            if _session_get_leader:
-                _session_get_flight = _session_get_claim
-            else:
-                # Followers never own an entry: `_session_get_flight` stays
-                # None so the finally below cannot release someone else's.
-                _shared_payload = None
-                if _session_get_claim["owner"] != threading.get_ident():
-                    # Never wait on a flight this thread owns — that would be
-                    # a self-deadlock if anything below re-entered this
-                    # handler for the same key.
-                    if _session_get_claim["event"].wait(
-                        _SESSION_GET_FLIGHT_WAIT_SECONDS
-                    ):
-                        _shared_payload = _session_get_claim["payload"]
-                if _shared_payload is not None:
-                    if _diag: _diag.finish()
-                    return j(handler, _shared_payload)
+        _display_owner_positions = ({} if load_messages and _cancelled_journal_turn_owner(
+            getattr(s, "messages", None) or [], include_live_partial=True
+        ) else None)
         if is_messaging_session:
             cli_messages = get_cli_session_messages(sid)
         elif load_messages:
@@ -14908,8 +13865,11 @@ def _handle_session_get(handler, parsed) -> bool:
                     s,
                     msg_limit,
                     msg_before=msg_before,
+                    owner_positions=_display_owner_positions,
                 )
             _state_db_reader_kwargs = {"profile": _session_profile}
+            if _cancelled_journal_turn_owner(getattr(s, "messages", None) or [], include_live_partial=True):
+                _state_db_reader_kwargs["include_row_identity"] = True
             if state_db_since_timestamp is not None:
                 _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
             # Apply the display-path row backstop ONLY on provably-safe
@@ -14943,6 +13903,7 @@ def _handle_session_get(handler, parsed) -> bool:
                     s,
                     limited_sidecar_messages,
                     msg_before=msg_before,
+                    owner_positions=_display_owner_positions,
                 )
             if _display_cache_hit is not None:
                 state_db_messages = []
@@ -15006,21 +13967,17 @@ def _handle_session_get(handler, parsed) -> bool:
                         state_db_messages,
                         state_db_signature=_display_state_db_signature,
                         msg_before=msg_before,
+                        owner_positions=_display_owner_positions,
                     )
             else:
                 state_db_messages = _suppress_native_image_display_mirrors(
                     s,
                     state_db_messages,
                 )
-                # #quiet-delegation: stamp the pending turn's _source onto the
-                # freshly-read state.db rows BEFORE merge/projection, so a
-                # reload during the deferred-save window cannot adopt the
-                # hidden handoff as a visible user row.
-                state_db_messages = _stamp_pending_source_for_display(
-                    s,
-                    state_db_messages,
+                lineage_owners = {}
+                sidecar_messages = _webui_sidecar_lineage_messages_for_display(
+                    s, owner_positions=lineage_owners,
                 )
-                sidecar_messages = _webui_sidecar_lineage_messages_for_display(s)
                 lineage_parent = _webui_lineage_parent_session_for_display(s)
                 projection_sidecar_messages = _merged_webui_lineage_messages_for_display(
                     s,
@@ -15032,6 +13989,8 @@ def _handle_session_get(handler, parsed) -> bool:
                     state_db_messages,
                     truncation_watermark=getattr(s, "truncation_watermark", None),
                     truncation_boundary=getattr(s, "truncation_boundary", None),
+                    incoming_provenance="state_db",
+                    cancelled_journal_owner_messages=getattr(s, "messages", None) or [],
                 )
                 _all_msgs = _merged_webui_lineage_messages_for_display(
                     s,
@@ -15043,6 +14002,11 @@ def _handle_session_get(handler, parsed) -> bool:
                     state_db_messages,
                     _all_msgs,
                 )
+                if _display_owner_positions is not None:
+                    _display_owner_positions.clear()
+                    _display_owner_positions.update(_display_projected_owner_positions(
+                        sidecar_messages, _all_msgs, lineage_owners,
+                    ))
         else:
             if is_messaging_session and cli_messages:
                 _all_msgs = _merged_session_messages_for_display(s, cli_messages)
@@ -15072,6 +14036,13 @@ def _handle_session_get(handler, parsed) -> bool:
         else:
             _summary_message_count = None
             _summary_last_message_at = None
+        _display_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
+        if _display_owner_positions is not None:
+            if msg_limit is None:
+                _display_owner_positions.update(_display_exact_owner_positions(s, _all_msgs))
+            _display_tool_calls = _display_rebased_tool_calls(
+                _display_tool_calls, _display_owner_positions
+            )
         if load_messages:
             _truncated_msgs, _messages_offset = _message_window_for_display(
                 _all_msgs,
@@ -15085,7 +14056,7 @@ def _handle_session_get(handler, parsed) -> bool:
                 _truncated_msgs,
                 getattr(s, "anchor_activity_scenes", None),
                 message_offset=_messages_offset,
-                tool_calls=getattr(s, "tool_calls", None),
+                tool_calls=_display_tool_calls,
             )
         else:
             _truncated_msgs = []
@@ -15157,7 +14128,7 @@ def _handle_session_get(handler, parsed) -> bool:
                         _fb_cl,
                     )
                 _persisted_cl = _fb_cl
-        _session_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
+        _session_tool_calls = _display_tool_calls
         # Always include session-level tool_calls so the browser can merge
         # them with per-message tool_calls for messages that lack the
         # per-message variant (older messages whose tool_calls live only
@@ -15258,16 +14229,6 @@ def _handle_session_get(handler, parsed) -> bool:
             # keep the raw count available as ``actual_message_count`` but
             # do not let it make the frontend expect phantom messages.
             raw["message_count"] = _merged_message_count
-        if load_messages and _all_msgs:
-            # #quiet-delegation gate review finding 3: after state.db has
-            # grown past the sidecar, compact()'s visible total can be stale
-            # (it trusts the sidecar prefix / metadata counts). On message
-            # loads the merged display transcript is the authority — derive
-            # the visible total from it.
-            raw["visible_message_count"] = sum(
-                1 for m in _all_msgs
-                if isinstance(m, dict) and not is_hidden_transcript_row(m)
-            )
         # Signal to the frontend that older messages were omitted. The
         # message window cursor already reflects visible-row pagination and
         # avoids false positives when raw hidden tool rows exceed msg_limit.
@@ -15313,14 +14274,7 @@ def _handle_session_get(handler, parsed) -> bool:
         redact = redact_session_data(raw)
         _t5 = _time.monotonic()
         if _diag: _diag.stage("t5_after_redact")
-        _session_get_payload = {"session": redact}
-        if _session_get_flight is not None:
-            # Publish the finished *redacted* projection and drop the entry in
-            # the same breath: waiters may start writing immediately, and no
-            # later read can ever reuse this payload (#7310).
-            _session_get_flight["payload"] = _session_get_payload
-            _finish_session_get_flight(_session_get_flight)
-        resp = j(handler, _session_get_payload)
+        resp = j(handler, {"session": redact})
         _t6 = _time.monotonic()
         if _diag: _diag.stage("t6_after_json_write")
         _total_ms = (_t6 - _t0) * 1000
@@ -15439,18 +14393,9 @@ def _handle_session_get(handler, parsed) -> bool:
             "messages": msgs,
             "tool_calls": [],
         }
-        for _key in ("parent_session_id", "relationship_type", "active"):
-            if getattr(synth, _key, None) is not None:
-                sess[_key] = getattr(synth, _key)
         attach_todo_state(sess, msgs)
         sess = _merge_cli_sidebar_metadata(sess, cli_meta)
         return j(handler, {"session": public_session_projection(sess)})
-    finally:
-        # #7310: release on every exit path — success, foreign-session
-        # KeyError, and any unexpected error. A leaked entry would park every
-        # later identical read on an event nobody sets; a follower never owns
-        # an entry, so this is a no-op for it.
-        _finish_session_get_flight(_session_get_flight)
 
 
 def handle_get(handler, parsed) -> bool:
@@ -15955,13 +14900,6 @@ def handle_get(handler, parsed) -> bool:
             days = 7
         return j(handler, get_provider_cost_history(provider_id, days))
 
-    if parsed.path == "/api/vault/status":
-        from api import vault_unlock
-        try:
-            return j(handler, vault_unlock.status())
-        except vault_unlock.VaultUnavailable:
-            return j(handler, {"backends": []})
-
     if parsed.path == "/api/settings":
         settings = load_settings()
         settings["persisted_speech_keys"] = persisted_speech_settings_keys()
@@ -16023,42 +14961,19 @@ def handle_get(handler, parsed) -> bool:
         return handle_transcribe_capability(handler)
 
     if parsed.path == "/api/reasoning":
-        # Current reasoning config. The active profile config remains the
-        # CLI-compatible default; session_id selects a durable WebUI override.
+        # Current reasoning config (shared source of truth with the CLI —
+        # reads display.show_reasoning and agent.reasoning_effort from
+        # the active profile's config.yaml).
         query = parse_qs(parsed.query)
         model_id = (query.get("model", [""])[0] or "").strip() or None
         provider_id = (query.get("provider", [""])[0] or "").strip() or None
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
-        session_id = (query.get("session_id", [""])[0] or "").strip() or None
-        effort_kwargs = {}
-        if session_id:
-            if not _session_id_visible_to_request_profile(handler, session_id):
-                return True
-            try:
-                reasoning_session = get_session(session_id, metadata_only=True)
-            except KeyError:
-                return bad(handler, "Session not found", 404)
-            session_effort = getattr(reasoning_session, "reasoning_effort", None)
-            if session_effort is None:
-                # Legacy session: fall back to the session profile's config,
-                # the same source both backends resolve at run time.
-                from api.profiles import get_hermes_home_for_profile
-
-                profile_cfg = get_config_for_profile_home(
-                    get_hermes_home_for_profile(getattr(reasoning_session, "profile", None)),
-                    isolate_config_override=True,
-                )
-                agent_cfg = profile_cfg.get("agent") if isinstance(profile_cfg, dict) else None
-                if isinstance(agent_cfg, dict):
-                    session_effort = agent_cfg.get("reasoning_effort")
-            effort_kwargs["effort_override"] = session_effort
         return j(
             handler,
             get_reasoning_status(
                 model_id=model_id,
                 provider_id=provider_id,
                 base_url=base_url,
-                **effort_kwargs,
             ),
         )
 
@@ -16270,14 +15185,6 @@ def handle_get(handler, parsed) -> bool:
             wss = load_workspaces(profile=active_profile)
         except TypeError:
             wss = load_workspaces()
-        # #5763 read slice: surface the profile's authoritative Hermes Projects
-        # store (projects.db) in the picker. Fail-safe: no DB / error => the
-        # local workspaces.json list unchanged.
-        try:
-            from api.projects_bridge import merge_hermes_projects
-            wss = merge_hermes_projects(wss)
-        except Exception:
-            logger.debug("projects.db workspace merge skipped", exc_info=True)
         try:
             lw = get_last_workspace(profile=active_profile)
         except TypeError:
@@ -16472,9 +15379,6 @@ def handle_get(handler, parsed) -> bool:
             structured_gateway, run_id = wait_for_gateway_run_id(stream_id, GATEWAY_RUN_ID_WAIT_TIMEOUT)
             if not run_id and structured_gateway:
                 gateway_stop_blocked = True
-            # F3: stop_gateway_run owns the atomic profile binding and fails
-            # closed when the owning profile is unknown or ambiguous, so a stop
-            # can never silently degrade to an unscoped (wrong-profile) endpoint.
             if run_id:
                 if stop_gateway_run(run_id):
                     owner_sid = stream_owner_session_id(stream_id)
@@ -16714,18 +15618,6 @@ def handle_get(handler, parsed) -> bool:
             skill_dir, _skill_md = _find_skill_in_dirs(
                 name, _active_skill_search_dirs(skills_dir)
             )
-            if not skill_dir:
-                # Plugin-registered skills live outside the local skills
-                # tree but expose the same SKILL.md / references / templates
-                # layout, so resolve the parent directory through the plugin
-                # manager before giving up (#7770).
-                try:
-                    pm = _get_plugin_manager_for_visibility()
-                    plugin_path = pm.find_plugin_skill(name)
-                except Exception:
-                    plugin_path = None
-                if plugin_path is not None:
-                    skill_dir = plugin_path.parent
             if not skill_dir:
                 return bad(handler, "Skill not found", 404)
             target = (skill_dir / file_path).resolve()
@@ -17206,21 +16098,6 @@ def handle_post(handler, parsed) -> bool:
             diag.finish()
         return proxy_result
 
-    if parsed.path in ("/api/vault/unlock", "/api/vault/lock"):
-        from api import vault_unlock
-        body = read_body(handler) or {}
-        backend = str(body.get("backend") or "")
-        try:
-            if parsed.path == "/api/vault/unlock":
-                result, status = vault_unlock.unlock(backend, str(body.get("master_password") or ""), body.get("profile"))
-                return j(handler, result, status=status)
-            result, status = vault_unlock.lock(backend or None, body.get("profile"))
-            return j(handler, result, status=status)
-        except vault_unlock.VaultUnavailable as exc:
-            return j(handler, {"success": False, "error": str(exc)}, status=501)
-        finally:
-            body.clear()
-
     if parsed.path == "/api/shutdown":
         return _handle_shutdown(handler)
 
@@ -17657,6 +16534,19 @@ def handle_post(handler, parsed) -> bool:
                 # 404, not 400 — missing resource, not a malformed request.
                 return bad(handler, "Session not found", status=404)
 
+            copy_messages = session.messages
+            copy_context = getattr(session, "context_messages", None) or []
+            if _cancelled_journal_turn_owner(session.messages, include_live_partial=True):
+                # Read one complete private snapshot for both persisted layers.
+                # A recovered sidecar can predate later Gateway exchanges.
+                copy_state = get_state_db_session_messages(
+                    sid, profile=getattr(session, "profile", None), include_row_identity=True,
+                )
+                copy_messages = reconciled_state_db_messages_for_session(session, state_messages=copy_state)
+                copy_context = reconciled_state_db_messages_for_session(
+                    session, prefer_context=True, state_messages=copy_state,
+                )
+
             # Deep-copy mutable lists so the duplicate is *actually* independent.
             # `Session.__init__` does `self.messages = messages or []` — plain
             # assignment, no copy. Without deepcopy, both sessions share the same
@@ -17671,8 +16561,7 @@ def handle_post(handler, parsed) -> bool:
                 workspace=session.workspace,
                 model=session.model,
                 model_provider=session.model_provider,
-                reasoning_effort=getattr(session, "reasoning_effort", None),
-                messages=copy.deepcopy(session.messages),
+                messages=copy.deepcopy(copy_messages),
                 tool_calls=copy.deepcopy(session.tool_calls),
                 # Reset ephemeral / per-session-instance flags. Duplicating an
                 # archived conversation should produce a visible (un-archived)
@@ -17699,7 +16588,7 @@ def handle_post(handler, parsed) -> bool:
                 # context_messages is the authoritative model-facing prefix — must be
                 # deepcopied so the duplicate has its own independent context that won't
                 # be mutated when the original session's context changes (#2914).
-                context_messages=copy.deepcopy(getattr(session, "context_messages", None) or []),
+                context_messages=copy.deepcopy(copy_context),
                 # Gateway routing — if the user customized routing for this session,
                 # the duplicate should behave identically.
                 gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
@@ -17717,10 +16606,17 @@ def handle_post(handler, parsed) -> bool:
                 updated_at=time.time(),
             )
 
+            # Reconciliation can insert SQLite rows before a saved tool owner.
+            # Map the original row objects before deepcopy, but update only the
+            # copy's tool dictionaries. Equal assistant prose is not ownership.
+            _reindex_tool_owners_after_message_reorder(
+                copied_session, session.messages, after_messages=copy_messages,
+            )
+
             with LOCK:
                 SESSIONS[copied_session.session_id] = copied_session
                 SESSIONS.move_to_end(copied_session.session_id)
-            _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
             # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
             # accidentally avoided this because `/api/session/rename` calls `s.save()`.
             # Without this explicit save, the duplicate is in-memory only — if the user
@@ -17815,10 +16711,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/reasoning":
         # CLI-parity /reasoning handler — writes to the same config.yaml keys
-        # the CLI uses and, when session_id is supplied, records the session
-        # override so conversation switches restore it. The profile default
-        # set via WebUI is still honoured in the terminal REPL and vice versa.
-        # Body is one of:
+        # the CLI uses (display.show_reasoning, agent.reasoning_effort) so a
+        # preference set via WebUI is honoured in the terminal REPL and vice
+        # versa.  Body is one of:
         #   {"display": "show"|"hide"|"on"|"off"}   → display.show_reasoning
         #   {"effort":  "none"|"minimal"|"low"|"medium"|"high"|"xhigh"}
         #                                            → agent.reasoning_effort
@@ -17836,30 +16731,15 @@ def handle_post(handler, parsed) -> bool:
                 model_id = str(body.get("model") or "").strip() or None
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
-                session_id = str(body.get("session_id") or "").strip() or None
-                reasoning_session = None
-                if session_id:
-                    try:
-                        reasoning_session = _get_or_materialize_session(session_id)
-                    except KeyError:
-                        return bad(handler, "Session not found", 404)
-                    except PermissionError:
-                        return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-                status = set_reasoning_effort(
-                    effort,
-                    model_id=model_id,
-                    provider_id=provider_id,
-                    base_url=base_url,
+                return j(
+                    handler,
+                    set_reasoning_effort(
+                        effort,
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        base_url=base_url,
+                    ),
                 )
-                if reasoning_session is not None:
-                    with _get_session_agent_lock(session_id):
-                        reasoning_session.reasoning_effort = str(effort or "").strip().lower()
-                        reasoning_session.save()
-                    # Cache eviction can commit agent lifecycle state and may do
-                    # provider I/O, so keep it outside the session mutation lock.
-                    from api.config import _evict_session_agent
-                    _evict_session_agent(session_id)
-                return j(handler, status)
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
@@ -18092,88 +16972,34 @@ def handle_post(handler, parsed) -> bool:
         if isinstance(files, list) and len(files) > _MAX_DRAFT_FILES:
             files = files[:_MAX_DRAFT_FILES]
         try:
-            get_session(sid, metadata_only=True)
+            s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        # Publish the save intent and wait for a generation-tagged settlement.
-        # Exactly one worker per session performs the actual Session.save();
-        # the request path never touches the per-session agent lock, so
-        # debounced autosaves cannot form a lock convoy (#7839). A request
-        # returns 200 only once its generation — or a newer generation that
-        # supersedes it — is durably saved, and the response carries the
-        # actual durable draft.
-        deadline = _draft_time.monotonic() + _DRAFT_SAVE_REQUEST_WAIT
-        with _DRAFT_CV:
-            state = _DRAFT_COALESCE.get(sid)
-            if state is None:
-                state = _DraftSaveState()
-                _DRAFT_COALESCE[sid] = state
-            state.generation += 1
-            gen = state.generation
-            if state.pending is None:
-                state.pending = _DraftSaveIntent(text, files)
+        _draft_mark("after_get_session")
+        unchanged = False
+        with _get_session_agent_lock(sid):
+            _draft_mark("acquired_lock")
+            current_draft = dict(getattr(s, "composer_draft", {}) or {})
+            next_draft = dict(current_draft)
+            if text is not None:
+                next_draft["text"] = text
+            if files is not None:
+                next_draft["files"] = files
+            if next_draft == current_draft:
+                unchanged = True
+                saved_draft = current_draft
             else:
-                # Worker hasn't consumed the queued intent yet: mutate it.
-                # A leftover _DraftSaveIntent can't be shared elsewhere.
-                if text is not None:
-                    state.pending.text = text
-                if files is not None:
-                    state.pending.files = files
-            _maybe_spawn_draft_worker(sid, state)
-            while True:
-                # This generation's own settlement, or a strictly newer "ok"
-                # that superseded this payload: both mean this request's draft
-                # (or newer) is durable. A newer "failed"/"missing" must NOT
-                # flip this request's earlier success into a false 503 — and
-                # this generation's failure never yields a false ok:true.
-                if gen in state.outcomes:
-                    outcome, unchanged, durable = state.outcomes[gen]
-                    settled = True
-                    break
-                newer_ok = None
-                for g in state.outcomes:
-                    if g > gen and state.outcomes[g][0] == "ok":
-                        newer_ok = g
-                        break
-                if newer_ok is not None:
-                    # Superseded by a newer durable save that includes this
-                    # request's payload (or a superset of it).
-                    outcome, unchanged, durable = state.outcomes[newer_ok]
-                    unchanged = False
-                    settled = True
-                    break
-                remaining = deadline - _draft_time.monotonic()
-                if remaining <= 0:
-                    settled = False
-                    outcome = None
-                    unchanged = False
-                    durable = None
-                    break
-                _DRAFT_CV.wait(remaining)
-        _draft_mark("settled")
-        if not settled:
-            # The worker is still saving (very large session or a heavy
-            # concurrent operation). Answer 503 instead of stacking this
-            # handler thread behind the convoy; the bounded self-heal retry
-            # still persists the intent, and the debounced autosave re-issues
-            # the latest payload on its next run.
-            handler._safe_webui_print(
-                "[SLOW] /api/session/draft worker wait timeout after %.0fms session=%s" % (
-                    (_draft_time.monotonic() - _draft_t0) * 1000,
-                    sid,
-                )
-            )
-            return bad(handler, "Draft save still in progress; retry shortly", 503)
-        if outcome == "missing":
-            # The session vanished between the request's existence preflight
-            # and the worker's load. Never report durability for that.
-            return bad(handler, "Session not found", 404)
-        if outcome != "ok":
-            return bad(handler, "Draft save failed; will retry on next edit", 503)
-        payload = {
-            "ok": True,
-            "draft": durable if durable is not None else {"text": text if text is not None else "", "files": files if files is not None else []},
-        }
+                s.composer_draft = next_draft
+                # Draft persistence is not conversation activity. Touching updated_at
+                # here makes the active-session external-refresh poll force-reload the
+                # current chat every few seconds while the user is typing, and that
+                # delayed reload can restore an older draft over newer local input.
+                _draft_mark("before_save")
+                s.save(touch_updated_at=False, skip_index=True)
+                _draft_mark("after_save")
+                saved_draft = s.composer_draft
+        _draft_mark("released_lock")
+        payload = {"ok": True, "draft": saved_draft}
         if unchanged:
             payload["unchanged"] = True
         _draft_mark("before_json")
@@ -18307,33 +17133,27 @@ def handle_post(handler, parsed) -> bool:
             event_profile = None
         # Serialize with recovery, but bound contention so a browser timeout
         # cannot be followed by a delayed server-side delete.
-        deadline = time.monotonic() + 5
         session_lock = _get_session_agent_lock(sid)
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
         try:
-            persistence_gate = session_persistence_gate(sid, SESSION_DIR)
-        except Exception:
-            session_lock.release()
-            raise
-        if not persistence_gate.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            session_lock.release()
-            return bad(handler, "Session busy, try again", 503)
-        try:
+            with LOCK:
+                SESSIONS.pop(sid, None)
             try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            revoke_session_persistence(persistence_gate)
-            with LOCK:
-                SESSIONS.pop(sid, None)
             sidecar_deleted = False
             try:
                 p.unlink(missing_ok=True)
             except Exception:
                 logger.debug("Failed to unlink session file %s", p)
             sidecar_deleted = not p.exists()
+            try:
+                prune_session_from_index(sid)
+            except Exception:
+                logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
             try:
                 p.with_suffix('.json.bak').unlink(missing_ok=True)
             except Exception:
@@ -18343,32 +17163,8 @@ def handle_post(handler, parsed) -> bool:
                     _record_webui_deleted_session_tombstone(sid)
                 except Exception:
                     logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
-            # Remove the turn-journal shards and the run-journal directory so a
-            # deleted conversation is not recoverable from disk. The session JSON +
-            # state.db rows are cleared above, but these journals retain the user's
-            # messages (turn journal) and the full request/response payloads (run
-            # journal) in plaintext. (#3802)
-            try:
-                from api.turn_journal import delete_turn_journal
-
-                delete_turn_journal(sid)
-            except Exception:
-                logger.debug("Failed to delete turn journal for deleted session %s", sid)
-            try:
-                from api.run_journal import delete_run_journal
-
-                delete_run_journal(sid)
-            except Exception:
-                logger.debug("Failed to delete run journal for deleted session %s", sid)
         finally:
-            persistence_gate.lock.release()
             session_lock.release()
-        # Index writes serialize separately. A late save is filtered by its
-        # captured lifetime in _write_session_index; do not invert index/gate locks.
-        try:
-            prune_session_from_index(sid)
-        except Exception:
-            logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
         # Evict outside the mutation lock: lifecycle commit may perform provider
         # I/O and must not hold a per-session Session lock.
         from api.config import _evict_session_agent
@@ -18379,6 +17175,23 @@ def handle_post(handler, parsed) -> bool:
             shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
         except Exception:
             logger.debug("Failed to clean attachment dir for deleted session %s", sid)
+        # Remove the turn-journal shards and the run-journal directory so a
+        # deleted conversation is not recoverable from disk. The session JSON +
+        # state.db rows are cleared above, but these journals retain the user's
+        # messages (turn journal) and the full request/response payloads (run
+        # journal) in plaintext. (#3802)
+        try:
+            from api.turn_journal import delete_turn_journal
+
+            delete_turn_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete turn journal for deleted session %s", sid)
+        try:
+            from api.run_journal import delete_run_journal
+
+            delete_run_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete run journal for deleted session %s", sid)
         # The weak lock registry releases this entry automatically after all
         # holders and waiters drop their strong references.
         # Prune the completion-dedup entry too. The reaper sweeps it once the
@@ -18390,15 +17203,6 @@ def handle_post(handler, parsed) -> bool:
             forget_bg_task_completion_dedup(sid)
         except Exception:
             logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
-        # #6885 round 2 lifecycle: session retirement is a terminal path — a
-        # deleted session's pending continuation record (marker + prompt +
-        # expiry) must not survive the session itself.
-        try:
-            from api.goals import clear_pending_goal_continuation
-
-            clear_pending_goal_continuation(sid)
-        except Exception:
-            logger.debug("Failed to clear pending goal continuation for deleted session %s", sid, exc_info=True)
         try:
             from api.terminal import close_terminal
             close_terminal(sid)
@@ -18611,6 +17415,7 @@ def handle_post(handler, parsed) -> bool:
         cli_meta = _lookup_cli_session_metadata(source.session_id) if _session_requires_cli_metadata_lookup(source) else {}
         is_messaging_session = _is_messaging_session_record(source) or _is_messaging_session_record(cli_meta)
         cli_messages = get_cli_session_messages(source.session_id) if is_messaging_session else []
+        source_context = getattr(source, "context_messages", None)
         if is_messaging_session:
             if cli_messages:
                 source_messages = _merged_session_messages_for_display(source, cli_messages)
@@ -18636,19 +17441,26 @@ def handle_post(handler, parsed) -> bool:
             _state_db_reader_kwargs = {
                 "profile": getattr(source, "profile", None) or None,
             }
+            cancelled_owner = _cancelled_journal_turn_owner(source.messages, include_live_partial=True)
+            if cancelled_owner:
+                _state_db_reader_kwargs["include_row_identity"] = True
             _backstop = _state_db_backstop_limit_for_display(source, None)
             if _backstop is not None:
                 _state_db_reader_kwargs["limit"] = _backstop
+            source_state = get_state_db_session_messages(source.session_id, **_state_db_reader_kwargs)
             source_messages = merge_session_messages_append_only(
                 _webui_sidecar_lineage_messages_for_display(source),
-                get_state_db_session_messages(
-                    source.session_id,
-                    **_state_db_reader_kwargs,
-                ),
+                source_state,
                 truncation_watermark=getattr(source, "truncation_watermark", None),
                 truncation_boundary=getattr(source, "truncation_boundary", None),
+                **({"incoming_provenance": "state_db", "cancelled_journal_owner_messages": source.messages}
+                   if cancelled_owner else {}),
             )
             source_messages = _merged_webui_lineage_messages_for_display(source, source_messages)
+            if cancelled_owner:
+                source_context = reconciled_state_db_messages_for_session(
+                    source, prefer_context=True, state_messages=source_state,
+                )
         if keep_count is not None:
             forked_messages = source_messages[:keep_count]
         else:
@@ -18667,7 +17479,7 @@ def handle_post(handler, parsed) -> bool:
         fork_keep = keep_count if keep_count is not None else len(source_messages)
         forked_context = copy.deepcopy(
             truncate_context_for_display_keep(
-                getattr(source, "context_messages", None),
+                source_context,
                 source_messages,
                 fork_keep,
             )
@@ -18684,7 +17496,6 @@ def handle_post(handler, parsed) -> bool:
             workspace=source.workspace,
             model=source.model,
             model_provider=getattr(source, "model_provider", None),
-            reasoning_effort=getattr(source, "reasoning_effort", None),
             profile=getattr(source, "profile", None),
             title=branch_title,
             messages=forked_messages,
@@ -18706,7 +17517,7 @@ def handle_post(handler, parsed) -> bool:
         with LOCK:
             SESSIONS[branch.session_id] = branch
             SESSIONS.move_to_end(branch.session_id)
-        _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
+            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
 
         # Persist only if there are messages (matches new_session pattern)
         if forked_messages:
@@ -18944,9 +17755,6 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/workspaces/remove":
         return _handle_workspace_remove(handler, body)
 
-    if parsed.path == "/api/workspaces/create_project":
-        return _handle_workspace_create_project(handler, body)
-
     if parsed.path == "/api/workspaces/rename":
         return _handle_workspace_rename(handler, body)
 
@@ -18984,26 +17792,6 @@ def handle_post(handler, parsed) -> bool:
         command = str(body.get("command", "") or "").strip()
         if not command:
             return bad(handler, "command is required")
-        sid = str(body.get("session_id", "") or "")
-        if sid and not _session_id_visible_to_request_profile(handler, sid):
-            return True
-        if command.split()[0].lower() in ("/loop", "loop"):
-            from api.loops import run_loop_command
-            return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2],
-                                                          request_profile=_get_active_profile_name())})
-
-        sid = str(body.get("session_id", "") or "")
-        if sid and not _session_id_visible_to_request_profile(handler, sid):
-            return True
-        if command.split()[0].lower() in ("/refine", "refine"):
-            from api.refine import run_refine_command
-            return j(handler, {"output": run_refine_command(sid, command.partition(" ")[2],
-                                                            request_profile=_get_active_profile_name())})
-
-        if command.split()[0].lower() in ("/review", "review"):
-            from api.review import run_review_command
-            return j(handler, {"output": run_review_command(sid, command.partition(" ")[2],
-                                                            request_profile=_get_active_profile_name())})
 
         try:
             return j(handler, {"output": execute_agent_command(command)})
@@ -19406,25 +18194,41 @@ def handle_post(handler, parsed) -> bool:
         # persisted index outside the lock, then re-check the in-memory
         # mutation set inside the lock and commit the pin atomically.
         if pin_requested and not getattr(s, "pinned", False):
+            try:
+                profiles = list_profiles_api()
+            except Exception:
+                profiles = []
+            root_profile_names = set(_root_profile_names_snapshot() or ()) | {"default"}
+            listed_root_names = {str(p["name"]) for p in profiles or [] if p.get("name") and p.get("is_default") is True}
+            nonroot_names = {str(p["name"]) for p in profiles or [] if p.get("name") and p.get("is_default") is False}
+            root_profile_names.update(listed_root_names)
+            conflicts = (root_profile_names - {"default"}) & nonroot_names
+            known_nonroots = nonroot_names - conflicts - {"default"}
+            pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
             # Pre-snapshot from persisted index (acquires LOCK internally,
             # so must run outside our own LOCK acquire below).
             persisted_rows = [
                 existing for existing in all_sessions()
                 if _session_counts_toward_pin_quota(existing)
             ]
+            admission_error = None
             with LOCK:
+                owner_profile = str(_session_field(s, "profile", None) or "default")
+                uncertain_owner = owner_profile in conflicts or owner_profile not in root_profile_names | nonroot_names
+                root_owner = owner_profile not in known_nonroots
+                quota_profile_names = root_profile_names - conflicts if root_owner else {owner_profile}
+                candidate_rows = list(persisted_rows)
                 # Final authoritative count: merge persisted pinned rows with the
                 # in-memory SESSIONS snapshot. Count logical sidebar-visible pin
                 # lineages rather than raw session rows so continuation siblings
                 # in the same visible lineage do not consume extra pin quota.
-                candidate_rows = list(persisted_rows)
                 candidate_rows.extend(
                     existing.compact() for existing in SESSIONS.values()
                     if _session_counts_toward_pin_quota(existing)
                 )
                 target_row = s.compact()
                 candidate_rows.append(target_row)
-                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
+                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows, profiles=quota_profile_names)
                 target_lineage = _session_row_lineage_root_id(
                     target_row,
                     {
@@ -19434,13 +18238,26 @@ def handle_post(handler, parsed) -> bool:
                     },
                 )
                 pinned_lineage_ids.discard(target_lineage)
-                pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
-                if len(pinned_lineage_ids) >= pinned_sessions_limit:
-                    return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
-                # Mark in-memory pin state under LOCK so concurrent pin
-                # requests see the increment immediately, even before
-                # save() finishes flushing to disk.
-                s.pinned = True
+                pinned_count = len(pinned_lineage_ids)
+                if root_owner:
+                    upper_profiles = {str(_session_field(row, "profile", None) or "default") for row in candidate_rows} - known_nonroots
+                    upper_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, upper_profiles))
+                if uncertain_owner:
+                    own_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, {owner_profile}))
+                if (own_count if uncertain_owner else pinned_count) >= pinned_sessions_limit:
+                    admission_error = (
+                        f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.",
+                        400,
+                    )
+                elif root_owner and upper_count >= pinned_sessions_limit:
+                    admission_error = ("Session profile information is incomplete; please retry.", 503)
+                else:
+                    # Mark in-memory pin state under LOCK so concurrent pin
+                    # requests see the increment immediately, even before
+                    # save() finishes flushing to disk.
+                    s.pinned = True
+            if admission_error:
+                return bad(handler, *admission_error)
             with _get_session_agent_lock(body["session_id"]):
                 s.save()
         else:
@@ -19876,10 +18693,6 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/session/import_cli":
         return _handle_session_import_cli(handler, body)
 
-    # ── Explicit, operator-gated Resume in WebUI (POST) ──
-    if parsed.path == "/api/session/resume_in_webui":
-        return _handle_session_resume_in_webui(handler, body)
-
     # ── Auth endpoints (POST) ──
     if parsed.path == "/api/auth/login":
         from api.auth import (
@@ -19892,7 +18705,7 @@ def handle_post(handler, parsed) -> bool:
 
         if not is_auth_enabled():
             return j(handler, {"ok": True, "message": "Auth not enabled"})
-        client_ip = _login_client_ip(handler)
+        client_ip = handler.client_address[0]
         if not _check_login_rate(client_ip):
             return j(
                 handler,
@@ -19940,7 +18753,7 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, {"error": "Passkey support is disabled."}, status=404)
         if not is_auth_enabled():
             return j(handler, {"error": "Auth not enabled"}, status=400)
-        client_ip = _login_client_ip(handler)
+        client_ip = handler.client_address[0]
         if not _check_login_rate(client_ip):
             return j(handler, {"error": "Too many attempts. Try again in a minute."}, status=429)
         try:
@@ -20289,7 +19102,16 @@ def _handle_session_export(handler, parsed):
     # ``public_session_projection`` supersedes the narrower
     # ``redact_session_data`` path so export context_messages uses the same
     # alias-stripping boundary as the visible transcript.
-    safe = public_session_projection(s.__dict__)
+    snapshot = dict(s.__dict__)
+    if _cancelled_journal_turn_owner(getattr(s, "messages", None) or [], include_live_partial=True):
+        state_messages = get_state_db_session_messages(
+            sid, profile=getattr(s, "profile", None), include_row_identity=True,
+        )
+        snapshot["messages"] = reconciled_state_db_messages_for_session(s, state_messages=state_messages)
+        snapshot["context_messages"] = reconciled_state_db_messages_for_session(
+            s, prefer_context=True, state_messages=state_messages
+        )
+    safe = public_session_projection(snapshot)
     qs = parse_qs(parsed.query)
     fmt = qs.get("format", ["json"])[0].lower()
     if fmt == "html":
@@ -20308,11 +19130,19 @@ def _handle_session_export(handler, parsed):
                         palette = parsed_palette
             except Exception:
                 palette = None
-        payload = render_session_html(safe, theme=theme, palette=palette)
+        html = render_session_html(safe, theme=theme, palette=palette)
+        # Join provider UTF-16 halves for presentation, while leaving durable
+        # session/journal text unchanged. Lone halves retain replacement output.
+        html = html.encode('utf-16-le', errors='surrogatepass').decode(
+            'utf-16-le', errors='replace'
+        )
+        payload = html.encode(
+            "utf-8", errors="replace"
+        )
         content_type = "text/html; charset=utf-8"
         ext = "html"
     else:
-        payload = json.dumps(safe, ensure_ascii=False, indent=2)
+        payload = _json_response_body(safe, pretty=True)
         content_type = "application/json; charset=utf-8"
         ext = "json"
     handler.send_response(200)
@@ -20320,10 +19150,10 @@ def _handle_session_export(handler, parsed):
     handler.send_header(
         "Content-Disposition", f'attachment; filename="hermes-{sid}.{ext}"'
     )
-    handler.send_header("Content-Length", str(len(payload.encode("utf-8"))))
+    handler.send_header("Content-Length", str(len(payload)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
-    handler.wfile.write(payload.encode("utf-8"))
+    handler.wfile.write(payload)
     return True
 
 
@@ -20433,13 +19263,7 @@ def _handle_sessions_search(handler, parsed):
                 sess = get_session_for_scan(s["session_id"])
                 if sess is None:
                     continue
-                # Hidden internal rows neither match nor consume the search
-                # depth budget (#quiet-delegation gate review).
-                scan_pool = [
-                    m for m in (sess.messages or [])
-                    if not is_hidden_transcript_row(m)
-                ]
-                msgs = scan_pool[:depth] if depth else scan_pool
+                msgs = sess.messages[:depth] if depth else sess.messages
                 for m in msgs:
                     c = _session_search_message_text(m)
                     if q in str(c).lower():
@@ -22423,6 +21247,28 @@ def _handle_tts(handler, parsed):
             from api.helpers import bad as _bad
             return _bad(handler, "unauthorized", 401)
 
+    # A chunked playback captures the profile that owns it, so a mid-playback
+    # profile switch cannot stream the previous profile's text under the new
+    # profile's provider/credentials. Requests that omit the field stay accepted
+    # (legacy direct callers); only an explicit MISMATCH is rejected, and it is
+    # rejected here — before the limiter, credential lookup or config access —
+    # so a mismatched chunk costs no quota and reads no other profile's config.
+    try:
+        claimed_profile = data.get("profile")
+    except Exception:
+        claimed_profile = None
+    if isinstance(claimed_profile, str) and claimed_profile.strip():
+        from api.helpers import bad as _bad
+        from api.profiles import _profiles_match, get_active_profile_name
+
+        claimed = claimed_profile.strip()
+        if not _profiles_match(claimed, get_active_profile_name()):
+            return _bad(
+                handler,
+                "playback profile no longer active",
+                409,
+            )
+
     # High-quality per-client rate limiting for TTS.
     if not hasattr(_handle_tts, "_tts_limiter"):
         import time as _time, threading as _threading
@@ -22636,6 +21482,7 @@ def _handle_tts(handler, parsed):
         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
+        "fr-FR-RemyMultilingualNeural", "fr-FR-VivienneMultilingualNeural",
         "id-ID-GadisNeural",
     }
     if voice not in allowed:
@@ -23861,11 +22708,39 @@ def _handle_session_sse_stream(handler, parsed):
                 payload = q.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
             except queue.Empty:
                 _sse_keepalive(handler)
+                # A completed keepalive is proof of life for an idle subscriber
+                # (re-gate finding 1): without this mark the reaper cannot tell a
+                # quiet-but-healthy tab from a half-open socket on an idle session,
+                # because an idle session never fills a subscriber's queue.
+                ch.note_subscriber_write_ok(q)
                 continue
             if payload is None:
+                # End-of-stream sentinel: the channel was deliberately closed
+                # (SessionChannel.close(), reaper or owner). Simply returning here
+                # does NOT end the response: under HTTP/1.1 keep-alive, with no
+                # Content-Length and no chunked framing, the server keeps the
+                # socket open, the browser's EventSource never sees EOF and stays
+                # attached to a channel the reaper already removed -- silently
+                # missing every later event (the "tab stops receiving updates"
+                # defect this change fixes). Flag the socket so the server closes
+                # it after this handler returns and the client reconnects onto the
+                # replacement channel. The #3103 note still holds: never advertise
+                # `Connection: close` up front (reconnect storms); this applies
+                # only to a deliberate end-of-channel.
+                try:
+                    handler.close_connection = True
+                except Exception:
+                    logger.debug(
+                        "session-stream: could not flag socket close for %s", sid,
+                        exc_info=True,
+                    )
                 break
             event_name, data = payload
             _sse(handler, event_name, data)
+            # Delivered: that write completed, so this subscriber is alive right
+            # now (re-gate finding 1). A write that raises instead never reaches
+            # this line, and its handler path unsubscribes in the finally below.
+            ch.note_subscriber_write_ok(q)
     except _CLIENT_DISCONNECT_ERRORS:
         pass  # client went away — normal for long-lived connections
     finally:
@@ -24598,34 +23473,18 @@ def _handle_cron_recent(handler, parsed):
                         "badge_notifications": job.get("badge_notifications") is not False,
                     }
                 )
-        session_lookup_failed = False
-        try:
-            latest_session_info = _latest_cron_session_info_for_jobs(
-                [job.get("id", "") for job in jobs],
-                [c["job_id"] for c in completions],
-                deadline_s=0.25,
-            )
-        except Exception:
-            latest_session_info = {}
-            session_lookup_failed = True
+        latest_session_info = _latest_cron_session_info_for_jobs(
+            [job.get("id", "") for job in jobs],
+            [c["job_id"] for c in completions],
+        )
         for completion in completions:
             info = latest_session_info.get(str(completion.get("job_id", "") or ""), {})
             completion["session_id"] = str(info.get("session_id", "") or "")
             if info.get("message_count") is not None:
                 completion["message_count"] = int(info["message_count"])
-        return j(
-            handler,
-            {
-                "completions": completions,
-                "since": since,
-                "session_lookup_failed": session_lookup_failed,
-            },
-        )
+        return j(handler, {"completions": completions, "since": since})
     except ImportError:
-        return j(
-            handler,
-            {"completions": [], "since": since, "session_lookup_failed": False},
-        )
+        return j(handler, {"completions": [], "since": since})
 
 
 _PROJECT_CONTEXT_HERMES_NAMES = (".hermes.md", "HERMES.md")
@@ -25045,6 +23904,12 @@ def _handle_btw(handler, body):
         register_stream_owner(stream_id, ephemeral.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Launch-phase ownership claim (re-gate finding B): the reaper's sweep
+            # makes this load-bearing on EVERY registration edge, not just the two
+            # chat/start paths -- an unclaimed stream whose worker has not been
+            # admitted yet is indistinguishable from a dead one, and the sweep would
+            # harvest it before the worker runs the task.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         from api.background import track_btw
         track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
         thr = threading.Thread(
@@ -25160,6 +24025,11 @@ def _handle_background(handler, body):
         register_stream_owner(stream_id, bg.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Same launch-phase claim as every other registration edge (re-gate
+            # finding B): its worker is scheduled below, and until it admits itself
+            # the claim is the only thing that tells the reaper's sweep this stream
+            # is launching rather than dead.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
         thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
         thr.start()
@@ -25462,19 +24332,9 @@ def _prepare_chat_start_session_for_stream(
     a normal session message. Empty sessions are never saved here because this
     helper only runs after a non-empty message is validated.
     """
-    # The internal delegation producer's explicit ``delegation_wakeup`` stamp
-    # is ROW provenance: the hidden-row predicate keys on it, so a fork
-    # session's ``session_source`` ownership override must never clobber it —
-    # otherwise the handoff renders as a human bubble in a fork (#7882 gate
-    # review, finding 3). Ordinary fork-human rows keep the fork identity via
-    # ``_fork_child_turn``, which is stamped from ``session_source`` below.
-    _prompt_is_delegation_wakeup = str(source or "").strip().lower() == "delegation_wakeup"
     effective_source = (
         "fork"
-        if (
-            str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
-            and not _prompt_is_delegation_wakeup
-        )
+        if str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
         else source
     )
     s.workspace = workspace
@@ -25529,14 +24389,7 @@ def _prepare_chat_start_session_for_stream(
                     context_row["_fork_child_turn"] = s.session_id
                 break
     current_title = getattr(s, "title", None)
-    # A delegation_wakeup handoff is not a human prompt: never let it name an
-    # untitled session (#quiet-delegation gate review).
-    _prompt_is_hidden_row = effective_source == "delegation_wakeup"
-    if (
-        retained_user is None
-        and not _prompt_is_hidden_row
-        and _is_default_or_empty_session_title(current_title)
-    ):
+    if retained_user is None and _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
@@ -25628,6 +24481,12 @@ def _cleanup_chat_start_launch_failure(
         unregister_stream_owner(stream_id)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+            # A launch whose worker never started must not strand its launch-phase
+            # claim: this path clears the registries directly and never reaches the
+            # canonical release funnel, and the orphan check keeps a claimed stream
+            # alive whatever the pending age -- so a stale claim would block every
+            # later chat/start for this stream id (re-gate finding 3).
+            retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
         STREAM_GOAL_RELATED.pop(stream_id, None)
     except Exception:
         logger.debug(
@@ -25703,6 +24562,29 @@ def _is_hidden_empty_session(s) -> bool:
     )
 
 
+def _pending_turn_in_registration_window(session) -> bool:
+    """Return whether a pending turn is still inside its registration grace window.
+
+    ``active_stream_id`` is published before the SSE channel is registered and
+    before the worker lands in ``ACTIVE_RUNS``, so a very fresh pending turn must
+    keep blocking duplicate chat/start requests even though neither registry
+    shows anything yet. Past the grace window a pending turn is no evidence of a
+    live worker: it is what a crashed turn leaves behind.
+    """
+    if not getattr(session, "pending_user_message", None):
+        return False
+    try:
+        from api.models import _REPAIR_STALE_PENDING_GRACE_SECONDS
+        grace_seconds = float(_REPAIR_STALE_PENDING_GRACE_SECONDS)
+    except Exception:
+        grace_seconds = 30.0
+    try:
+        pending_started_at = float(getattr(session, "pending_started_at", None) or 0)
+    except Exception:
+        pending_started_at = 0.0
+    return bool(pending_started_at and time.time() - pending_started_at < grace_seconds)
+
+
 def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     """Return whether an active_stream_id still owns this session's next turn.
 
@@ -25710,32 +24592,100 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     very fresh pending turn must also block duplicate chat_start requests. If we
     only check STREAMS here, a second request can race through the registration
     gap and overwrite the sidecar owner.
+
+    STREAMS membership alone is not evidence of a live turn: the entry is only
+    removed by the worker's own finalization, so a hard-killed or wedged worker
+    leaves it behind and every later chat/start for that session is refused with
+    ``409 session already has an active stream`` — for hours, since the SSE
+    channel reaper never touches this registry. The authoritative liveness check
+    is ``ACTIVE_RUNS`` (keyed by ``stream_id``, unregistered in the worker's
+    outer ``finally``); the fresh-pending guard covers the window between stream
+    registration and worker registration. When a stream is registered, no worker
+    is live and no pending turn is inside that window, it is an orphan: drop it
+    from both registries and let the caller admit a fresh turn.
     """
     if not stream_id:
         return False
+    orphan_released = False
     with STREAMS_LOCK:
         if stream_id in STREAMS:
-            return True
+            # ONE definition of "orphan", shared with every other reader
+            # (re-gate finding 2): registered, no live worker, no launch-phase
+            # claim, and no pending turn inside its registration window. The claim
+            # check is what keeps a stream that is still launching alive whatever
+            # the pending age (finding 5).
+            # The predicate fails CLOSED on its own when the worker registry cannot
+            # be read (api.config._is_orphaned_stream_locked returns False for an
+            # unreadable ACTIVE_RUNS), so no second guard belongs here: one
+            # definition, one owner. A local try/except would be unreachable.
+            if not is_orphaned_stream(
+                stream_id,
+                pending_turn_in_window=_pending_turn_in_registration_window(session),
+                streams_lock_held=True,
+            ):
+                return True
+            # Confirmed orphan. Clear the WHOLE stream-owned state, not just the
+            # registry entry: a crashed or wedged worker never reaches its own
+            # teardown, so this stream's agent instance / cancel flag / partial
+            # and reasoning text / live tool calls / goal marker / last event id
+            # would otherwise stay allocated for the life of the process -- one
+            # stale set per recovered orphan. The set and the lock mirror the
+            # canonical teardown (api/streaming.py, api/gateway_chat.py).
+            # STREAMS_LOCK is already held and threading.Lock is not reentrant,
+            # so the entries are removed directly instead of by re-entering a
+            # helper. Lock order stays STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK,
+            # the order the rest of the lifecycle uses (never the reverse).
+            from api import config as _live_config
+            _orphan_session_id = getattr(session, "session_id", None)
+            # ONE call releases every registry the stream owns
+            # (the shared stream_owned_registries() list + both owner registries) -- the single
+            # teardown entry point, so this path can never clear a hand-picked
+            # subset again. The session writeback entry is compare-and-clear: a
+            # successor admitted after this orphan keeps its registry claim.
+            # STREAMS_LOCK is already held and threading.Lock is not reentrant.
+            try:
+                _live_config.release_stream_owned_registries(
+                    stream_id,
+                    session_id=_orphan_session_id,
+                    streams_lock_held=True,
+                )
+            except Exception:
+                logger.debug(
+                    "chat/start: could not release the stream-owned registries "
+                    "for orphan %s",
+                    stream_id,
+                    exc_info=True,
+                )
+            logger.info(
+                "chat/start: cleared orphaned stream %s for session %s "
+                "(no live worker, no pending turn in the registration window)",
+                stream_id,
+                _orphan_session_id or "?",
+            )
+            orphan_released = True
+    if orphan_released:
+        # Gateway-owned rows (run lifecycle / run id / endpoint) live in
+        # api/gateway_chat.py and are released through their no-op-safe
+        # lifecycle/waiter path, which must NOT run nested under STREAMS_LOCK:
+        # the canonical Gateway teardown releases that lock before the same step.
+        try:
+            from api.gateway_chat import release_gateway_stream_state
+
+            release_gateway_stream_state(stream_id)
+        except Exception:
+            logger.debug(
+                "chat/start: could not release the Gateway state for orphan %s",
+                stream_id,
+                exc_info=True,
+            )
+        return False
     try:
-        from api import config as _live_config
-        with _live_config.ACTIVE_RUNS_LOCK:
-            if stream_id in (_live_config.ACTIVE_RUNS or {}):
+        with ACTIVE_RUNS_LOCK:
+            if stream_id in (ACTIVE_RUNS or {}):
                 return True
     except Exception:
         pass
-    if getattr(session, "pending_user_message", None):
-        try:
-            from api.models import _REPAIR_STALE_PENDING_GRACE_SECONDS
-            grace_seconds = float(_REPAIR_STALE_PENDING_GRACE_SECONDS)
-        except Exception:
-            grace_seconds = 30.0
-        try:
-            pending_started_at = float(getattr(session, "pending_started_at", None) or 0)
-        except Exception:
-            pending_started_at = 0.0
-        if pending_started_at and time.time() - pending_started_at < grace_seconds:
-            return True
-    return False
+    return _pending_turn_in_registration_window(session)
 
 
 def _local_agent_worker_kwargs(*, model_provider, goal_related: bool, moa_config) -> dict:
@@ -25838,6 +24788,9 @@ def _start_regeneration_stream_locked(
             STREAM_GOAL_RELATED.pop(stream_id, None)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+            # Launch failure ends the launch phase: the claim must not outlive the
+            # registration it was published for (#7302 finding 5).
+            retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
         unregister_stream_owner(stream_id)
         clear_session_writeback_owner_if_owned(s.session_id, stream_id)
         if gateway_starting:
@@ -25909,13 +24862,18 @@ def _start_regeneration_stream_locked(
         register_stream_owner(stream_id, s.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Launch-phase ownership claim (#7302 finding 5): published atomically
+            # with the registration so the orphan check keeps this stream while its
+            # worker is still being admitted -- this path holds that worker at
+            # release_worker.wait() while s.save() runs below.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         if goal_related:
             STREAM_GOAL_RELATED[stream_id] = True
         if backend_is_gateway:
             from api.gateway_chat import _mark_gateway_run_starting
 
             gateway_starting = True
-            _mark_gateway_run_starting(stream_id, profile=getattr(s, "profile", None))
+            _mark_gateway_run_starting(stream_id)
 
         diag.stage("worker_thread_start") if diag else None
         worker_thread = threading.Thread(target=_gated_worker, daemon=True)
@@ -26115,53 +25073,6 @@ def _agent_runtime_barrier_response(
     return None
 
 
-def _normalize_goal_continuation_id(raw) -> str:
-    """Coerce a client-supplied continuation ID to a safe token (#7855).
-
-    Rejects anything that is not a compact hex string so a malformed or
-    hostile value can never reach the matcher: returns "" (the "no ID"
-    signal, which keeps the turn a genuine user turn) for None, non-strings,
-    empty/whitespace, wrong length or non-hex characters.
-    """
-    if raw is None:
-        return ""
-    token = str(raw).strip().lower()
-    if not token:
-        return ""
-    if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
-        return ""
-    return token
-
-
-def _consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict | bool | None:
-    """#7855 admission: consume the goal-continuation record only when the
-    incoming turn carries the matching continuation ID.
-
-    The marker is session-scoped (#1932) and set when goal_continue fires;
-    the ID is issued at the same moment and travels with the browser's queued
-    continuation. Without the ID match, a genuine user/queued turn arriving
-    before the browser's auto-dispatch would be misclassified as goal-related
-    and would inherit goal-continuation semantics. When the ID differs (or is
-    absent), the user turn keeps priority and the record is left in place for
-    the browser's actual continuation dispatch.
-
-    Admission is by ID, not text (#7855): the queue UI lets the user edit or
-    combine a queued entry, and there is no wall-clock expiry, so a late or
-    edited continuation is still admitted. Marker, prompt and ID are one
-    record in api.goals; the admission check delegates there so check + drop
-    stay atomic.
-
-    On a match the return value is the **rollback receipt**: the popped
-    record itself (marker + prompt + ID together). A rejected chat start must
-    restore both halves (#7249 rolls back rejected starts), so callers keep
-    the receipt rather than re-deriving what was consumed — restoring the
-    marker alone left the retry unmatchable (maintainer's #7862 repro).
-    """
-    from api.goals import consume_pending_goal_continuation
-
-    return consume_pending_goal_continuation(session_id, msg)
-
-
 def _start_chat_stream_for_session(
     s,
     *,
@@ -26175,7 +25086,6 @@ def _start_chat_stream_for_session(
     normalized_model: bool = False,
     diag=None,
     goal_related: bool = False,
-    goal_continuation_id: str = "",
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
@@ -26227,43 +25137,20 @@ def _start_chat_stream_for_session(
 
     consumed_goal_continuation = False
     consumed_bg_task_completion = False
-    # #1932: this session may have a pending goal continuation. The streaming
-    # hook sets PENDING_GOAL_CONTINUATION when goal_continue fires, so the next
-    # chat/start for this session is automatically treated as goal-related.
-    # #6885 + #7855: the marker is consumed ONLY when the request carries the
-    # continuation ID the server issued at goal_continue time — a genuine
-    # user/queued turn (no ID) keeps priority and leaves the marker for the
-    # browser's auto-dispatch, while an edited / combined / late-sent
-    # continuation still carries its ID and keeps the goal.
-    #
-    # #7855 rebase compat (#7249): the admission runs INSIDE the session lock
-    # via consume_continuation_markers(), not up front. Admission pops BOTH
-    # halves (marker + prompt record, api/goals.py), so a rejected start must
-    # restore both; rolling back the marker alone left the retry unmatchable
-    # (maintainer's #7862 repro: consume -> rollback -> retry consume False).
-    # The popped record therefore travels as a rollback receipt and
-    # restore_consumed_continuation_markers() re-arms the pair — unless a
-    # newer continuation was armed for this session meanwhile.
-    consumed_goal_continuation_receipt = None
 
     def consume_continuation_markers() -> None:
         nonlocal goal_related, consumed_goal_continuation, consumed_bg_task_completion
-        nonlocal consumed_goal_continuation_receipt
-        if not goal_related and goal_continuation_id:
-            receipt = _consume_pending_goal_continuation(s.session_id, goal_continuation_id)
-            if receipt:
-                goal_related = True
-                consumed_goal_continuation = True
-                consumed_goal_continuation_receipt = receipt
+        if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+            goal_related = True
+            PENDING_GOAL_CONTINUATION.discard(s.session_id)
+            consumed_goal_continuation = True
         if s.session_id in PENDING_BG_TASK_COMPLETIONS:
             PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
             consumed_bg_task_completion = True
 
     def restore_consumed_continuation_markers() -> None:
         if consumed_goal_continuation:
-            from api.goals import restore_pending_goal_continuation
-
-            restore_pending_goal_continuation(s.session_id, consumed_goal_continuation_receipt)
+            PENDING_GOAL_CONTINUATION.add(s.session_id)
         if consumed_bg_task_completion:
             PENDING_BG_TASK_COMPLETIONS.add(s.session_id)
 
@@ -26401,6 +25288,10 @@ def _start_chat_stream_for_session(
                     register_stream_owner(stream_id, s.session_id)
                     with STREAMS_LOCK:
                         STREAMS[stream_id] = stream
+                        # Same launch-phase claim as the regeneration path
+                        # (#7302 finding 5): the ordinary start has the same
+                        # registration-then-worker-admission window.
+                        publish_pre_admission_claim(stream_id, streams_lock_held=True)
                     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
                     if goal_related:
                         STREAM_GOAL_RELATED[stream_id] = True
@@ -26422,7 +25313,7 @@ def _start_chat_stream_for_session(
                     if backend_is_gateway:
                         from api.gateway_chat import _mark_gateway_run_starting
 
-                        _mark_gateway_run_starting(stream_id, profile=getattr(s, "profile", None))
+                        _mark_gateway_run_starting(stream_id)
                     thr = threading.Thread(
                         target=worker_target,
                         args=(s.session_id, msg, model, workspace, stream_id, attachments),
@@ -26496,7 +25387,9 @@ def _start_chat_stream_for_session(
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
-            cleared = _clear_stale_stream_state(s)
+            # chat_start is itself a writer that just released this lock: wait for a
+            # transient holder instead of answering 409 for a dead stream (#8072 review).
+            cleared = _clear_stale_stream_state(s, wait_for_writer=True)
             if not cleared and getattr(s, "active_stream_id", None):
                 diag.stage("response_write") if diag else None
                 return {
@@ -26514,7 +25407,6 @@ def _start_chat_stream_for_session(
         except Exception:
             logger.debug("Failed to publish session_new after chat start", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
-
     try:
         set_last_workspace(workspace, profile=getattr(s, "profile", None))
     except Exception:
@@ -26661,7 +25553,6 @@ def _start_run(
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
     goal_related: bool = False,
-    goal_continuation_id: str = "",
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
@@ -26749,7 +25640,6 @@ def _start_run(
                 goal_related=goal_related,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
-                goal_continuation_id=goal_continuation_id,
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -26801,7 +25691,6 @@ def _start_run(
         goal_related=goal_related,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
-        goal_continuation_id=goal_continuation_id,
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -26961,7 +25850,7 @@ def start_session_turn(
                     session_id,
                     exc_info=True,
                 )
-        if turn_source in ("process_wakeup", "delegation_wakeup"):
+        if turn_source == "process_wakeup":
             _credential_state_changed = False
             try:
                 _credential_state_changed = process_wakeup_pause_credential_state_changed(s)
@@ -27206,7 +26095,6 @@ def _handle_session_compression_recovery_start(handler, body):
                 workspace=getattr(source, "workspace", get_last_workspace()),
                 model=getattr(source, "model", None),
                 model_provider=getattr(source, "model_provider", None),
-                reasoning_effort=getattr(source, "reasoning_effort", None),
                 messages=[],
                 tool_calls=[],
                 pinned=False,
@@ -27242,7 +26130,7 @@ def _handle_session_compression_recovery_start(handler, body):
             with LOCK:
                 SESSIONS[copied_session.session_id] = copied_session
                 SESSIONS.move_to_end(copied_session.session_id)
-            _evict_sessions_over_cap()
+                _evict_sessions_over_cap()
             created = True
     if created:
         publish_session_list_changed(
@@ -27296,14 +26184,13 @@ def _handle_goal_command(handler, body):
         except ImportError:
             requested_profile = ""
     if requested_profile and not _profiles_match(getattr(s, "profile", None), requested_profile):
-        has_persisted_turns = bool(
-            getattr(s, "messages", None)
-            or getattr(s, "context_messages", None)
-            or getattr(s, "pending_user_message", None)
+        session_profile, retag_result = _retag_empty_session_profile(
+            s, requested_profile
         )
-        if not has_persisted_turns:
-            from api.loops import retag_session_profile
-            retag_session_profile(s, requested_profile)
+        if retag_result == "pinned_empty":
+            return _session_profile_mismatch_response(
+                handler, body.get("session_id", ""), session_profile
+            )
 
     current_stream_id = getattr(s, "active_stream_id", None)
     stream_running = False
@@ -27459,33 +26346,6 @@ def _handle_goal_command(handler, body):
             status = 409 if payload.get("error") == "agent_running" else 400
         return j(handler, payload, status=status)
 
-    # #6885 round 2 lifecycle: the /goal command is the natural traffic hook
-    # for record upkeep. A cleared/paused goal has no continuation coming, so
-    # any pending record for this session must not outlive it (an abandoned
-    # browser dispatch would otherwise keep the pair resident until expiry);
-    # sweeping expired/orphaned records here bounds the rest without a
-    # background timer.
-    # #7855 rebase compat (#7249): this hook must not fire for runner-owned
-    # goals. The runner does not drive the browser's queued continuation, so
-    # there is no record to clear, and the sweep below runs on the runner's
-    # traffic for goals it owns locally.
-    if not runner_goal_owned:
-        if goal_adapter_action in ("clear", "pause"):
-            from api.goals import clear_pending_goal_continuation
-
-            try:
-                clear_pending_goal_continuation(s.session_id)
-            except Exception:
-                logger.debug(
-                    "Failed to clear pending goal continuation for %s", s.session_id, exc_info=True
-                )
-        from api.goals import sweep_expired_goal_continuations
-
-        try:
-            sweep_expired_goal_continuations()
-        except Exception:
-            logger.debug("Failed to sweep expired goal continuations", exc_info=True)
-
     def _rollback_goal_after_failed_kickoff() -> None:
         restore_goal_state(s.session_id, previous_goal_state, profile_home=profile_home)
 
@@ -27608,237 +26468,6 @@ def _save_chat_start_compression_recovery(session):
 
 
 def _handle_chat_start(handler, body, diag=None):
-    # ── Idempotency claim (issue #7435) ────────────────────────────────────
-    # A caller-supplied key (header ``Idempotency-Key`` or body field
-    # ``idempotency_key``) lets external automation retry after a lost
-    # connection without re-admitting the same logical turn. The claim
-    # MUST happen before any state-mutating work (session materialization,
-    # pending-state writes, the worker thread) and BEFORE the agent
-    # execution that ``_start_run`` triggers. Without a key the route keeps
-    # its current behavior.
-    idem_key = _idem_extract_key(handler, body)
-    idem_claim_record = None  # filled in only if a key was supplied
-    idem_validated_key: str | None = None
-    idem_completed = False  # flipped True only after a successful start
-    idem_profile: str | None = None  # resolved once per request (Finding 3)
-    idem_turn_admitted = False  # True once _start_run admits a real turn
-    # ``_idem_extract_key`` returns ``IDEM_KEY_ABSENT`` when the
-    # key is truly absent on both transports; any other value
-    # means the caller explicitly supplied something and we must
-    # route it through validation (which rejects empty /
-    # non-string / oversize with 400, per the #7435 review).
-    if idem_key is not IDEM_KEY_ABSENT:
-        try:
-            idem_validated_key = _idem_validate_key(idem_key)
-        except IdempotencyKeyMalformed as exc:
-            # The caller explicitly supplied a key (header or body
-            # field) that is empty / whitespace / non-string /
-            # over-length / has disallowed chars. Per #7435 review:
-            # never silently downgrade to legacy behavior — return
-            # 400 so the client can fix its request and retry.
-            return bad(handler, str(exc), 400)
-        except IdempotencyKeyMissing as exc:
-            return bad(handler, str(exc), 400)
-        # Resolve the profile namespace ONCE, then thread that value
-        # through fingerprint, claim, complete, reconcile and release so
-        # a mid-request profile switch cannot claim in one namespace and
-        # complete/release in another (#7435 review Finding 3).
-        try:
-            idem_profile = _idem_resolve_active_profile()
-        except IdempotencyStoreUnavailable as exc:
-            # The active profile could not be resolved, so the key has
-            # no provable namespace. Fail closed (503) rather than
-            # filing the claim under a namespace we never verified.
-            logger.warning(
-                "idempotency: cannot resolve profile scope for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        except Exception as exc:
-            logger.warning(
-                "idempotency: profile resolution failed for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        try:
-            fingerprint = _idem_compute_fingerprint(body, profile=idem_profile)
-        except IdempotencyStoreUnavailable as exc:
-            logger.warning(
-                "idempotency: cannot compute fingerprint for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        except Exception as exc:
-            # An unhashable / unserializable body still must not let the
-            # request through with an empty fingerprint: an empty
-            # fingerprint matches every later retry, which would turn a
-            # legitimate 409 conflict into a replay. Refuse instead.
-            logger.warning(
-                "idempotency: could not fingerprint request for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        # Finding 1 (#7435 review): a keyed request must NEVER fall through
-        # to the keyless legacy path just because the store could not be
-        # acquired. Failure to acquire the store is the same fail-closed 503
-        # used for claim/store errors — silently continuing to _start_run
-        # with no claim defeats the one-turn guarantee.
-        try:
-            store = get_idempotency_store()
-        except Exception as exc:
-            logger.warning(
-                "idempotency: store acquisition failed for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        if store is None:
-            # Defensive: treat a None store the same as acquisition failure.
-            logger.warning(
-                "idempotency: store unavailable (None) for key %r",
-                idem_validated_key,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        try:
-            # Mint the turn identity HERE and persist it with the claim
-            # (#7782 finding 1). A crash between the claim and the moment
-            # ``_start_run`` returns its real stream_id used to leave a
-            # pending record with NO identity on disk; a restarted process
-            # then answered every retry for that key with
-            # ``409 idempotency_in_flight`` + ``retry_after_seconds: 1``
-            # for the remaining TTL. Carrying the minted identity means a
-            # restarted process finds a pending record WITH a stream_id,
-            # which ``claim`` replays as the original turn.
-            _idem_provisional_stream = f"stream-{uuid.uuid4().hex}"
-            idem_claim_record = store.claim_with_identity(
-                idem_validated_key,
-                fingerprint,
-                profile=idem_profile,
-                session_id=str(body.get("session_id") or ""),
-                stream_id=_idem_provisional_stream,
-                turn_id=f"turn-{uuid.uuid4().hex}",
-            )
-        except IdempotencyConflict as exc:
-            return j(handler, {
-                "error": str(exc),
-                "code": "idempotency_conflict",
-                "idempotency_key": idem_validated_key,
-            }, status=409)
-        except IdempotencyOutcomeUnknown as exc:
-            # Recovered from a crash between the claim and the identity
-            # binding. Distinct from in-flight: NO retry hint, because a
-            # blind retry is exactly what could double-execute the turn.
-            return j(handler, {
-                "error": str(exc),
-                "code": "idempotency_outcome_unknown",
-                "idempotency_key": idem_validated_key,
-            }, status=409)
-        except IdempotencyInFlight as exc:
-            return j(handler, {
-                "error": str(exc),
-                "code": "idempotency_in_flight",
-                "idempotency_key": idem_validated_key,
-                "retry_after_seconds": 1,
-            }, status=409)
-        except IdempotencyKeyExpired as exc:
-            return j(handler, {
-                "error": str(exc),
-                "code": "idempotency_key_expired",
-                "idempotency_key": idem_validated_key,
-            }, status=410)
-        except IdempotencyStoreUnavailable as exc:
-            # Persistent store couldn't durably commit the new
-            # claim; the in-memory state has been rolled back.
-            # Surface 503 so the caller retries with the same
-            # key — a fresh claim will be admitted on the next
-            # attempt (no phantom record survives).
-            logger.warning(
-                "idempotency: claim persist failed for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        except Exception as exc:  # corrupt store / disk error
-            # Don't admit silently; refuse explicitly so the caller
-            # can retry rather than risk a duplicate turn.
-            logger.warning(
-                "idempotency: claim failed for key %r: %s",
-                idem_validated_key, exc,
-            )
-            return j(handler, {
-                "error": "idempotency store unavailable; retry",
-                "code": "idempotency_store_unavailable",
-                "idempotency_key": idem_validated_key,
-            }, status=503)
-        if idem_claim_record.status == "complete" or (
-            idem_claim_record.status == "pending"
-            and idem_claim_record.stream_id
-        ):
-            # Replay the original acceptance. This short-circuits
-            # BEFORE any session lookup, pending-state write, or
-            # worker thread start — a lost-response retry does not
-            # even touch disk.
-            if idem_claim_record.status == "pending":
-                # A turn was admitted earlier but its completion never
-                # became durable; its identity was reconciled onto the
-                # pending claim (see ``reconcile``). The turn is real,
-                # so mark it admitted — the finally clause must NOT
-                # release this guard as if it were a refused start.
-                idem_turn_admitted = True
-            payload = _idem_build_response_payload(idem_claim_record)
-            status = int(idem_claim_record.response_status or 200)
-            if diag is not None:
-                diag.stage("idempotency_replay")
-                diag.finish()
-            if status < 200 or status >= 400:
-                # Treat any non-2xx stored result as a stale failure;
-                # release so the caller can retry with the same key
-                # and (presumably) a different network.
-                try:
-                    store.release(idem_validated_key, profile=idem_profile)
-                except Exception as exc:
-                    # A stale (non-2xx) completion could not be
-                    # durably dropped. Keep the stored result: it is
-                    # already durable, so replaying it is fail-closed
-                    # — the caller cannot silently re-admit a turn the
-                    # durable store still remembers as attempted.
-                    logger.warning(
-                        "idempotency: could not release stale completion "
-                        "for key %r: %s",
-                        idem_validated_key, exc,
-                    )
-                return j(handler, {
-                    "error": "previous attempt did not complete; retry",
-                    "code": "idempotency_replay_unavailable",
-                    "idempotency_key": idem_validated_key,
-                }, status=503)
-            return j(handler, payload, status=status)
     try:
         diag.stage("validate_session_id") if diag else None
         try:
@@ -27946,34 +26575,22 @@ def _handle_chat_start(handler, body, diag=None):
             except ImportError:
                 requested_profile = ""
         session_profile = getattr(s, "profile", None)
-        has_persisted_turns = bool(
-            getattr(s, "messages", None)
-            or getattr(s, "context_messages", None)
-            or getattr(s, "pending_user_message", None)
-        )
         if not _session_visible_to_active_profile(session_profile, handler):
             if (
                 requested_profile
                 and _profiles_match(requested_profile, active_profile)
-                and not has_persisted_turns
             ):
-                # Empty placeholders can still be retagged when the
-                # requested profile matches the active request profile.
-                from api.loops import retag_session_profile
-                retag_session_profile(s, requested_profile)
-            elif session_profile:
-                # #7710: known other profile → 409 ``session_profile_mismatch``
-                # so the client can offer to switch to it (#5419).
-                # 404 is preserved only for the None-profile
-                # (unknown/legacy) self-heal case.
-                return j(handler, {
-                    "error": "Session belongs to a different profile",
-                    "code": "session_profile_mismatch",
-                    "session_id": body.get("session_id", ""),
-                    "profile": session_profile,
-                }, status=409)
+                session_profile, retag_result = (
+                    _retag_empty_session_profile(s, requested_profile)
+                )
+                if retag_result not in ("same_owner", "retagged"):
+                    return _session_profile_mismatch_response(
+                        handler, body.get("session_id", ""), session_profile
+                    )
             else:
-                return bad(handler, "Session not found", 404)
+                return _session_profile_mismatch_response(
+                    handler, body.get("session_id", ""), session_profile
+                )
         # Resolve durable rotations before any workspace/model/pending mutation.
         # GET navigation adopts the tip; POST never silently replays a user turn.
         from api.compression_continuation import durable_compression_continuation
@@ -28116,13 +26733,25 @@ def _handle_chat_start(handler, body, diag=None):
                 or explicit_model_pick
             ):
                 return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
-        elif model_provider == "moa" and moa_config is None:
-            from api.commands import resolve_moa_config
+        elif model_provider == "moa":
+            from api.commands import agent_has_moa_virtual_provider, resolve_moa_config
 
-            try:
-                moa_config = resolve_moa_config(model)
-            except RuntimeError as e:
-                return bad(handler, str(e), 503)
+            if agent_has_moa_virtual_provider():
+                # hermes-agent serves the virtual ``moa`` provider itself and runs
+                # the selected preset through its MoA facade (profile-scoped
+                # config, fan-out cadence, degraded-reference policy). Also
+                # passing a per-turn ``moa_config`` makes run_conversation() run
+                # a SECOND, legacy fan-out + synthesis on every tool iteration,
+                # and the rewritten user message defeats the facade's per-turn
+                # reference cache. Never stack the two paths.
+                moa_config = None
+            elif moa_config is None:
+                # Older hermes-agent without the virtual provider: keep the
+                # legacy per-turn MoA path so a ``moa`` session still runs MoA.
+                try:
+                    moa_config = resolve_moa_config(model)
+                except RuntimeError as e:
+                    return bad(handler, str(e), 503)
         # NOTE: runtime-adapter selection is delegated to _start_run (shared
         # with start_session_turn so both entry points behave identically
         # under runtime_adapter_enabled() / runtime_adapter_runner_enabled()
@@ -28139,12 +26768,6 @@ def _handle_chat_start(handler, body, diag=None):
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
             "regeneration": regeneration,
-            # #7855: the server-issued continuation ID travels with the browser's
-            # queued continuation through inline edits and combines; admission
-            # is by ID, never by text, so an edited/late/combined continuation
-            # keeps its goal semantics and a genuine user message (no ID) does
-            # not. Rejected as malformed here rather than by the matcher.
-            "goal_continuation_id": _normalize_goal_continuation_id(body.get("goal_continuation_id")),
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
@@ -28186,142 +26809,10 @@ def _handle_chat_start(handler, body, diag=None):
             if restore_err is not None:
                 return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
         diag.stage("response_write") if diag else None
-        # Idempotency: a 2xx with a stream_id is a real started turn. Mark
-        # the claim complete so a retry after a lost response replays the
-        # original identity instead of admitting a second turn. Anything
-        # else (4xx/5xx) is a refused start; the finally block below
-        # releases the claim so the caller can retry.
-        #
-        # CRITICAL: ``idem_completed`` is only flipped True AFTER
-        # ``complete()`` returns successfully. If the durable write
-        # fails, complete() rolls back the in-memory mutation and
-        # raises IdempotencyStoreUnavailable; we surface 503 to the
-        # caller so they know the durability guarantee was broken.
-        # The turn itself is already admitted and cannot be undone, so
-        # we reconcile the admitted identity onto the pending claim
-        # (``reconcile``) rather than releasing it: a retry must replay
-        # the original turn, not admit a second one. ``idem_turn_admitted``
-        # is set so the finally clause never releases a guard that
-        # represents a real, already-started turn.
-        if (
-            idem_claim_record is not None
-            and idem_validated_key is not None
-            and status < 400
-            and response.get("stream_id")
-        ):
-            idem_turn_admitted = True
-            _idem_session_id = response.get("session_id") or body.get("session_id", "")
-            _idem_stream_id = response.get("stream_id") or ""
-            _idem_turn_id = response.get("turn_id") or ""
-            try:
-                get_idempotency_store().complete(
-                    idem_validated_key,
-                    profile=idem_profile,
-                    session_id=_idem_session_id,
-                    stream_id=_idem_stream_id,
-                    turn_id=_idem_turn_id,
-                    response_status=status,
-                    response_payload=response,
-                )
-                idem_completed = True
-            except IdempotencyStoreUnavailable as exc:
-                # Durable write failed AFTER the agent turn was admitted.
-                # The in-memory state is rolled back to the prior pending
-                # record. We MUST NOT drop the guard: the turn is real, so
-                # we durably bind its identity onto the pending claim so a
-                # retry replays it (recorder stays at one) instead of
-                # starting a second turn — the duplicate-execution barrier
-                # the review demanded. ``idem_turn_admitted`` stays True so
-                # the finally clause does not release this claim.
-                logger.warning(
-                    "idempotency: complete() persist failed for key %r: %s; "
-                    "reconciling the admitted identity onto the pending claim",
-                    idem_validated_key, exc,
-                )
-                try:
-                    get_idempotency_store().reconcile(
-                        idem_validated_key,
-                        profile=idem_profile,
-                        session_id=_idem_session_id,
-                        stream_id=_idem_stream_id,
-                        turn_id=_idem_turn_id,
-                    )
-                except Exception as _rec_exc:
-                    # Even reconcile failed: the identity could not be made
-                    # durable. The pending guard is still retained (only its
-                    # identity rollback happened), so a retry is refused
-                    # rather than re-admitting a second turn. Surface 503 so
-                    # the caller can reconcile externally.
-                    logger.warning(
-                        "idempotency: reconcile() failed for key %r: %s",
-                        idem_validated_key, _rec_exc,
-                    )
-                return j(handler, {
-                    "error": "idempotency store unavailable; turn started but could not be recorded for replay",
-                    "code": "idempotency_store_unavailable",
-                    "idempotency_key": idem_validated_key,
-                }, status=503)
-            except Exception as exc:
-                # Finding 4 (#7435 review): do NOT swallow an unexpected
-                # exception from complete(). Treat it as unavailable and
-                # retain the claim. The bug this fixes is the generic
-                # ``return j(handler, response)`` that reused to answer 200
-                # with the claim released — a state in which the only
-                # durable guard was deleted.
-                logger.warning(
-                    "idempotency: complete() raised unexpectedly for key %r: %s",
-                    idem_validated_key, exc,
-                )
-                return j(handler, {
-                    "error": "idempotency store unavailable; turn started but could not be recorded for replay",
-                    "code": "idempotency_store_unavailable",
-                    "idempotency_key": idem_validated_key,
-                }, status=503)
         return j(handler, response, status=status)
     finally:
         if diag:
             diag.finish()
-        # Release a still-pending claim if the request didn't make it to
-        # acceptance (validation rejection, exception, or non-2xx from
-        # _start_run). The contract says "fail explicitly; no stale claim"
-        # so a follow-up with the SAME key + same fingerprint can be
-        # retried without an IdempotencyInFlight error.
-        #
-        # ``idem_turn_admitted`` guards the release: once _start_run has
-        # admitted a real turn (2xx + stream_id reached the completion
-        # step, or a pending-with-identity replay was seen), the pending
-        # claim is the ONLY record of that turn — even if its completion
-        # or reconcile write failed — and must never be dropped on this
-        # cleanup path. Dropping it would delete the duplicate-execution
-        # barrier and let a retry re-admit the same logical turn.
-        if (
-            idem_claim_record is not None
-            and not idem_completed
-            and not idem_turn_admitted
-            and idem_claim_record.status == "pending"
-            and idem_validated_key is not None
-        ):
-            try:
-                get_idempotency_store().release(
-                    idem_validated_key, profile=idem_profile
-                )
-            except Exception as exc:
-                # release() is fail-closed: it restores the pending claim
-                # when its own durable write fails, so the claim survives
-                # and a retry sees idempotency_in_flight (or 503) instead
-                # of a fresh claim that would admit a second turn. The
-                # in-flight guard must not be dropped just because we are
-                # on a cleanup path — that is precisely the duplicate-turn
-                # window this store exists to close. We cannot turn this
-                # into a 503 here (the response is already in flight on
-                # the success path), so the durable pending claim stands
-                # and the caller retries against it.
-                logger.warning(
-                    "idempotency: release() could not durably drop the claim "
-                    "for key %r: %s; the pending claim is retained so a retry "
-                    "is refused rather than re-admitted",
-                    idem_validated_key, exc,
-                )
 
 
 
@@ -29951,91 +28442,7 @@ def _handle_workspace_add(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    # #5763 read bridge: projects.db re-appends its projects on every list
-    # poll, so removing the local workspace alone makes the delete appear to
-    # do nothing. Archive the owning DB project too (fail-safe, never raises).
-    try:
-        from api.projects_bridge import archive_hermes_project
-        archive_hermes_project(resolved_path)
-    except Exception:
-        logger.debug("workspace remove: project archive failed for %s", resolved_path)
     return j(handler, {"ok": True, "workspaces": wss})
-
-
-def _handle_workspace_create_project(handler, body):
-    """Create a Hermes Project (projects.db) AND a WebUI workspace in one step.
-
-    #5763 write slice: the WebUI "new project" flow registers the project in
-    the profile's authoritative projects.db (visible to Desktop/CLI) instead of
-    only the local picker list. If the path is already a registered workspace
-    the projects.db registration still runs (idempotent on duplicate folder).
-    """
-    path_str = _strip_surrounding_quotes(body.get("path", "").strip())
-    name = _strip_surrounding_quotes(body.get("name", "").strip())
-    auto_create = body.get("create", False)
-    if not path_str:
-        return bad(handler, "path is required")
-    try:
-        from api.workspace import _remote_terminal_workspace_candidate, _resolve_path
-        from api.profiles import get_active_profile_name
-        active_profile = get_active_profile_name()
-        remote_candidate = _remote_terminal_workspace_candidate(path_str, profile=active_profile)
-        candidate = _resolve_path(path_str, profile=active_profile)
-    except (ValueError, OSError, RuntimeError) as e:
-        return bad(handler, f"Invalid path: {_sanitize_error(e)}")
-    if remote_candidate is not None:
-        return bad(handler, "Remote terminal paths cannot be registered as Hermes Projects")
-    if _is_blocked_system_path(candidate):
-        _home = _home_path()
-        if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
-            return bad(handler, f"Path points to a system directory: {candidate}")
-    # Fail BEFORE any side effect (mkdir, local save) when the native Projects
-    # manager is unreachable — a fresh profile with no projects.db is fine (the
-    # native manager initializes it), but no-manager installs must not be left
-    # with an orphan directory and a half-saved workspace.
-    from api.projects_bridge import projects_write_supported
-    if not projects_write_supported():
-        return bad(handler, "Hermes Projects are not available for this install (hermes_cli not reachable)")
-    if auto_create:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-        except (OSError, PermissionError) as e:
-            return bad(handler, f"Could not create directory: {_sanitize_error(e)}")
-    try:
-        p = validate_workspace_to_add(path_str, profile=active_profile)
-    except ValueError as e:
-        return bad(handler, str(e))
-    project_name = name or p.name
-    # 1) Register in projects.db (authoritative store shared with Desktop/CLI).
-    from api.projects_bridge import create_hermes_project
-    try:
-        project = create_hermes_project(str(p), project_name)
-    except ValueError as e:
-        # Path already belongs to another project: not fatal for the workspace
-        # half of the operation — surface it but continue.
-        project = {"error": str(e)}
-    except RuntimeError as e:
-        # Directory may exist from auto_create above, but no workspace was
-        # saved and no project registered: the operation is cleanly retryable.
-        return bad(handler, _sanitize_error(e))
-    # 2) Ensure the local picker list has it too (harmless if the read bridge
-    # already surfaces it; save_workspaces dedupe keeps this cheap).
-    from api.projects_bridge import merge_hermes_projects
-    try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
-    if not any(w["path"] == str(p) for w in wss):
-        wss.append({"path": str(p), "name": project_name})
-        try:
-            save_workspaces(wss, profile=active_profile)
-        except TypeError:
-            save_workspaces(wss)
-    try:
-        merged = merge_hermes_projects(load_workspaces(profile=active_profile))
-    except Exception:
-        merged = wss
-    return j(handler, {"ok": True, "project": project, "workspaces": merged})
 
 
 def _handle_workspace_remove(handler, body):
@@ -30044,19 +28451,11 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    # Resolve once and use the same string for the local filter and the DB
-    # archive: the bridge normalizes (abspath/expanduser) while the local
-    # filter was an exact match, so a "~/x" or trailing-slash variant could
-    # archive the shared project while leaving the local entry behind.
-    import os as _os
-    resolved_path = _os.path.abspath(_os.path.expanduser(path_str)).rstrip("/\\")
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    def _same_path(a: str, b: str) -> bool:
-        return _os.path.abspath(_os.path.expanduser(str(a).strip())).rstrip("/\\") == resolved_path
-    wss = [w for w in wss if not _same_path(w["path"], path_str)]
+    wss = [w for w in wss if w["path"] != path_str]
     try:
         save_workspaces(wss, profile=active_profile)
     except TypeError:
@@ -30080,32 +28479,11 @@ def _handle_workspace_rename(handler, body):
             w["name"] = name
             break
     else:
-        # Not in the local list: a DB-only project (created from Desktop/CLI)
-        # still appears in the picker via the read bridge — rename it in the
-        # DB, which is authoritative for the name of a path it owns.
-        from api.projects_bridge import merge_hermes_projects, rename_hermes_project
-        result = rename_hermes_project(path_str, name)
-        if not result.get("renamed"):
-            return bad(handler, "Workspace not found", 404)
-        try:
-            merged = merge_hermes_projects(load_workspaces(profile=active_profile))
-        except TypeError:
-            merged = merge_hermes_projects(load_workspaces())
-        except Exception:
-            merged = wss
-        return j(handler, {"ok": True, "workspaces": merged})
+        return bad(handler, "Workspace not found", 404)
     try:
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    # #5763 read bridge: projects.db is authoritative for the name of a path
-    # it owns, so a local-only rename reverts on the next poll. Propagate to
-    # the DB (fail-safe, never raises).
-    try:
-        from api.projects_bridge import rename_hermes_project
-        rename_hermes_project(path_str, name)
-    except Exception:
-        logger.debug("workspace rename: project rename failed for %s", path_str)
     return j(handler, {"ok": True, "workspaces": wss})
 
 
@@ -30126,30 +28504,13 @@ def _handle_workspace_reorder(handler, body):
     except TypeError:
         wss = load_workspaces()
     by_path = {w["path"]: w for w in wss}
-    # DB-only projects (projects.db, not in workspaces.json) appear in the
-    # picker via the read bridge; without a local row their dragged position
-    # cannot persist and the response silently drops them. Materialize a local
-    # row for any requested path the DB owns.
-    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects
-    import os as _os
-    def _norm(p: str) -> str:
-        return _os.path.abspath(_os.path.expanduser(str(p).strip())).rstrip("/\\")
-    db_by_path = {}
-    try:
-        db_by_path = {_norm(e["path"]): e for e in load_hermes_project_workspaces()}
-    except Exception:
-        pass
+    # Build reordered list: given order first, then any omitted entries
     reordered = []
     seen = set()
     for p in paths:
         p = p.strip()
         if p in by_path and p not in seen:
             reordered.append(by_path[p])
-            seen.add(p)
-        elif p not in seen and _norm(p) in db_by_path:
-            entry = db_by_path[_norm(p)]
-            row = {"path": entry["path"], "name": entry["name"]}
-            reordered.append(row)
             seen.add(p)
     # Append any workspaces not mentioned (safety net)
     for w in wss:
@@ -30160,13 +28521,7 @@ def _handle_workspace_reorder(handler, body):
     except TypeError:
         # Legacy signature (test doubles with single-arg lambdas, older forks).
         save_workspaces(reordered)
-    # Return the merged view so DB-only entries the caller never mentioned
-    # still appear (the picker renders this response directly).
-    try:
-        merged = merge_hermes_projects(reordered)
-    except Exception:
-        merged = reordered
-    return j(handler, {"ok": True, "workspaces": merged})
+    return j(handler, {"ok": True, "workspaces": reordered})
 
 
 def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: str = "") -> bool:
@@ -30369,9 +28724,11 @@ def _relay_gateway_run_approval(
     """Relay one exact run-backed mirror under the shared `(session, run)` owner.
 
     The mirror remains actionable unless the remote Runs API confirms success.
+    Both the approval-card endpoint and the ordinary session-YOLO endpoint use
+    this chokepoint so one tab cannot retire another tab's parked remote run.
     """
-    from api.config import gateway_supports_approval_identity_v1, get_config as _get_config
-    from api.gateway_chat import _gateway_api_key, _gateway_base_url_for_profile, gateway_run_endpoint
+    from api.config import gateway_supports_approval_identity_v1
+    from api.gateway_chat import gateway_run_endpoint
     from api.runner_client import HttpRunnerClient, RunnerClientError
 
     run_id = str(mirror.get("run_id") or "").strip()
@@ -30413,41 +28770,7 @@ def _relay_gateway_run_approval(
                 enable_yolo=enable_yolo,
             )
 
-# Resolve the owning gateway profile without ever letting a missing or
-        # unscoped binding abort an otherwise valid relay. The mirror's immutable
-        # binding is authoritative when present; the session sidecar corroborates
-        # it. F1: a lost/absent session must not raise here. An unscoped binding
-        # falls back to the multiplexed default route rather than silently
-        # relaying against a profile-less base URL.
-        mirror_profile = str(current_mirror.get("_gateway_profile") or "").strip()
-        try:
-            approval_session = get_session(sid)
-        except KeyError:
-            approval_session = None
-        raw_profile = getattr(approval_session, "profile", None)
-        session_profile = raw_profile.strip() if isinstance(raw_profile, str) else ""
-        # A current sidecar may corroborate the mirror binding, but it can never
-        # invent or override ownership. Reject only an explicit mismatch.
-        if mirror_profile and session_profile and mirror_profile != session_profile:
-            return _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                status=409,
-                enable_yolo=enable_yolo,
-            )
-        # Never invent an owning profile. When neither the immutable mirror
-        # binding nor the session sidecar names a profile, relay against the
-        # unscoped owner URL rather than guessing "/p/default", which could route
-        # the approval to the wrong profile. (``_gateway_base_url_for_profile``
-        # returns the unscoped base URL for an empty profile.)
-        gateway_profile = mirror_profile or session_profile
-        base_url = _gateway_base_url_for_profile(
-            gateway_profile,
-            _get_config(),
-        )
-        api_key = _gateway_api_key()
+        base_url, api_key = gateway_run_endpoint(run_id)
         identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and (
             gateway_supports_approval_identity_v1(base_url, api_key)
         )
@@ -32342,24 +30665,11 @@ def _normalize_names_list(names) -> list[str]:
 
 
 def _toggle_name_in_list(names, name: str, enabled: bool) -> list[str]:
-    """Add or remove *name* from *names*, returning a new list.
-
-    Entries are COMPARED in their env-RESOLVED form but RETURNED in their raw
-    form: a profile may hold ``skills.disabled: ["${DISABLED_SKILL}"]``, and the
-    reader expands that to the real skill name. Comparing the raw placeholder
-    against the resolved ``name`` would never match, so the API reported success
-    while the skill stayed disabled (#5619). Returning the original raw entries
-    keeps the ``${VAR}`` indirection on disk instead of baking the resolved
-    value into config.yaml.
-    """
+    """Add or remove *name* from *names*, returning a new list."""
     names = _normalize_names_list(names)
-    resolved = _expand_env_vars(names)
     if enabled:
-        # strict=True: _expand_env_vars() maps 1:1, so the lengths always match.
-        return [
-            raw for raw, res in zip(names, resolved, strict=True) if res != name
-        ]
-    if name not in resolved:
+        return [d for d in names if d != name]
+    if name not in names:
         names.append(name)
     return names
 
@@ -32389,9 +30699,7 @@ def _handle_skill_toggle(handler, body):
 
     config_path = _active_profile_config_path()
     with _cfg_lock:
-        # RAW load — the write transaction must not bake env-expanded secrets
-        # into the profile's config.yaml (#5619 write-target rule).
-        cfg = _load_yaml_config_file_raw(config_path)
+        cfg = _load_yaml_config_file(config_path)
 
         # Ensure skills section exists as a dict
         if "skills" not in cfg or not isinstance(cfg["skills"], dict):
@@ -32833,1318 +31141,6 @@ def _handle_session_import_cli(handler, body):
     )
 
 
-# ─ Safe backend Resume in WebUI (explicit, operator-gated handoff) ───────────
-#
-# While ``HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY`` is set, foreign CLI/TUI/ACP/
-# Desktop sessions are projected from each profile's ``state.db`` as read-only
-# stubs and can never be materialised as writable WebUI sidecars
-# (``_claim_or_synthesize_cli_session`` forces ``claimable = False``). That
-# leaves an operator with no sanctioned way to *take over* a genuinely finished
-# foreign session from the WebUI, so this endpoint is the single, explicit path
-# that performs the handoff. It is deliberately narrow:
-#
-#   * operator allowlist (``HERMES_WEBUI_RESUME_ALLOW_PROFILES``) — unset means
-#     the endpoint is disabled entirely; a requested profile must be listed;
-#   * the requested profile must be the WebUI's active profile;
-#   * the server resolves ``<profile home>/state.db`` exactly (no active-profile
-#     fallback) and opens it strictly read-only;
-#   * only ``cli``/``tui``/``acp``/``desktop`` sources are resumable;
-#   * a source session that still looks live (no ``ended_at``/``end_reason``) is
-#     refused unless WebUI already owns a matching writable sidecar;
-#   * the client's exact lineage root + tip must match
-#     ``read_session_lineage_report``;
-#   * a flat sidecar id collision (the WebUI store is not profile-qualified) is
-#     refused when the existing sidecar is blank/other-profile;
-#
-# The endpoint never writes to the source ``state.db``: it opens it read-only
-# for every probe (row, lineage), then materialises the same session id as a
-# writable WebUI sidecar bound to the requested profile.
-_RESUME_IN_WEBUI_SOURCE_ALLOWLIST = frozenset({"cli", "tui", "acp", "desktop"})
-
-
-
-def _resume_in_webui_allowed_profiles() -> set:
-    """Return the operator allowlist of profiles permitted to resume.
-
-    Read at request time so operators can flip it without a restart. An unset
-    or blank value disables the endpoint (fail-closed).
-    """
-    raw = str(os.getenv("HERMES_WEBUI_RESUME_ALLOW_PROFILES", "") or "")
-    return {part.strip() for part in raw.split(",") if part.strip()}
-
-
-def _open_source_state_db_readonly(db_path: Path):
-    """Open *db_path* with a strict ``mode=ro`` URI and no writable fallback.
-
-    Unlike ``open_state_db_readonly`` there is deliberately no fallback to a
-    read-write handle: this endpoint must never be able to mutate the source
-    ``state.db`` it is resuming from. Callers own the returned connection.
-    """
-    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
-
-
-def _load_resume_sidecar_nonmutating(sidecar_path: Path):
-    """Load a resume sidecar without Session.load() self-heal writes."""
-    data = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("existing WebUI sidecar is not a JSON object")
-    return Session(**data)
-
-
-def _same_resume_identity(
-    session,
-    *,
-    sid: str,
-    profile: str,
-    db_path: Path,
-    root_id: str,
-    tip_id: str,
-) -> bool:
-    return (
-        str(getattr(session, "session_id", None) or "") == str(sid)
-        and not bool(getattr(session, "read_only", False))
-        and _profiles_match(getattr(session, "profile", None), profile)
-        and (
-            getattr(session, "resume_source_profile", None),
-            getattr(session, "resume_source_state_db", None),
-            getattr(session, "resume_lineage_root_id", None),
-            getattr(session, "resume_lineage_tip_id", None),
-        )
-        == (profile, str(db_path), root_id, tip_id)
-    )
-
-
-def _resume_existing_sidecar_conflict(
-    session,
-    *,
-    sid: str,
-    profile: str,
-    db_path: Path,
-    root_id: str,
-    tip_id: str,
-) -> str | None:
-    """Return the 409 message when *session* blocks this resume, else ``None``.
-
-    ``None`` means the sidecar already owns exactly this resume identity, so the
-    request is an idempotent re-resume. Shared by the pre-flight ownership check
-    and by the post-claim reconciliation of a lost exclusive publication race,
-    so both paths classify an existing sidecar identically.
-    """
-    existing_profile = getattr(session, "profile", None)
-    # The WebUI sidecar store is a single flat directory; the same session id
-    # can collide across profiles. Refuse a blank or foreign-profile sidecar
-    # rather than silently overwriting another profile's session.
-    if not str(existing_profile or "").strip() or not _profiles_match(existing_profile, profile):
-        return "a different WebUI session already owns this session id"
-    # The sidecar's own session id must equal the requested source id: the
-    # filename supplies it implicitly, so a replaced/hand-edited body that names
-    # a different session must never be accepted as an idempotent re-resume (D4).
-    if str(getattr(session, "session_id", None) or "") != str(sid):
-        return "an existing WebUI sidecar does not match this resume identity"
-    stored_identity = (
-        getattr(session, "resume_source_profile", None),
-        getattr(session, "resume_source_state_db", None),
-        getattr(session, "resume_lineage_root_id", None),
-        getattr(session, "resume_lineage_tip_id", None),
-    )
-    if bool(getattr(session, "read_only", False)) or stored_identity != (
-        profile,
-        str(db_path),
-        root_id,
-        tip_id,
-    ):
-        return "an existing WebUI sidecar does not match this resume identity"
-    return None
-
-
-def _discard_resume_staging_file(staging_path: Path) -> None:
-    """Best-effort removal of a Resume staging file that never got published."""
-    try:
-        Path(staging_path).unlink(missing_ok=True)
-    except Exception:
-        logger.warning(
-            "Failed to remove Resume in WebUI staging file %s",
-            staging_path,
-            exc_info=True,
-        )
-
-
-def _resume_canonical_is_committed_publication(sidecar_path: Path) -> bool:
-    """True when the canonical is an explicitly committed, non-denied publication.
-
-    B2: such an artifact was committed by an attempt that finished its own
-    verified commit. A *different*, failing attempt must never revoke it — not
-    by denying the id and not by moving the file out of the live namespace.
-    """
-    from api.models import resume_publication_strictly_verified
-
-    try:
-        current = _load_resume_sidecar_nonmutating(Path(sidecar_path))
-    except Exception:
-        return False
-    if current is None:
-        return False
-    return resume_publication_strictly_verified(current)
-
-
-def _quarantine_resume_sidecar(
-    sidecar_path: Path,
-    sid: str,
-    *,
-    attempt: str | None = None,
-    force: bool = False,
-) -> Path | None:
-    """Deny and move an untrusted published resume sidecar out of the live namespace.
-
-    F3 (Astra 94bfe8af): quarantine is a durable *denial* first and a
-    best-effort move second. ``revoke_resume_publication`` records the denial on
-    every durable channel (tombstone AND the publication ledger) BEFORE the
-    canonical is touched, so a delayed reader that already loaded the object
-    during the publication window — and a reader that races a failed move —
-    still fails closed. The move into ``.resume-quarantine`` (never deleted
-    outright) is best effort so an operator can inspect the rejected artifact;
-    when it fails the durable denial still refuses the id, so publication stays
-    failed-closed either way. B1: when BOTH channels fail, the in-flight
-    publication record written before the artifact existed still guards the id,
-    so the fail-closed state does not depend on this process's memory.
-
-    B2: ``force=False`` refuses to revoke an artifact that is already a
-    committed (verified, non-denied) publication — a failed attempt must never
-    revoke another attempt's artifact. Callers that provably own the commit
-    (they just wrote the verified marker for it in this request) pass
-    ``force=True``.
-    """
-    sidecar_path = Path(sidecar_path)
-    if not force and _resume_canonical_is_committed_publication(sidecar_path):
-        logger.warning(
-            "Refusing to revoke committed Resume publication %s: the canonical "
-            "belongs to an attempt that already finished its verified commit",
-            sid,
-        )
-        return None
-    # 1) Denial first — this fences in-flight Session.load/cache publication.
-    # A2: `revoke_resume_publication` records the tombstone AND evicts any cached
-    # writable object in ONE critical section that also bumps the revocation
-    # generation, so a reader parked between its admissibility check and its
-    # cache insertion is refused rather than repopulating the cache.
-    try:
-        from api.models import revoke_resume_publication
-
-        revoke_resume_publication(
-            sid,
-            reason="resume publication failed post-publish verification",
-            attempt=attempt,
-        )
-    except Exception:
-        logger.exception("Failed to record resume quarantine denial for %s", sid)
-    # 2) Best-effort move out of the live namespace — through the ONE shared
-    # implementation (``models.quarantine_denied_resume_sidecar``), so the
-    # publication path and the post-write denial recheck in ``Session.save``
-    # cannot drift into different quarantine semantics.
-    moved = None
-    try:
-        from api.models import quarantine_denied_resume_sidecar
-
-        moved = quarantine_denied_resume_sidecar(sid, source=sidecar_path)
-    except Exception:
-        logger.exception("Failed to quarantine untrusted resume sidecar %s", sidecar_path)
-    target: Path | None = moved
-    # 2b) A denial outranks any commit-complete proof, so a revoked id must not
-    # keep carrying one: the proof is the ONLY thing that authorises retiring a
-    # publication record or completing an orphan's commit, and a later reader
-    # must never find "committed" on an id that was durably refused. Best
-    # effort — the denial itself is what actually fences the id.
-    try:
-        from api.models import clear_resume_publication_commit_marker
-
-        clear_resume_publication_commit_marker(sid)
-    except Exception:
-        logger.debug("Failed to clear the Resume commit proof for %s", sid, exc_info=True)
-    # 3) Evict any writable object a concurrent reader cached during the
-    # publication/read-back window BEFORE reconciling the index. The denial
-    # above already refuses it from cache, but eviction keeps the LRU and the
-    # persisted sidebar honest.
-    try:
-        from api.models import evict_session_from_cache, prune_session_from_index
-
-        evict_session_from_cache(sid)
-        prune_session_from_index(sid)
-    except Exception:
-        logger.debug("Failed to evict cached resume sidecar %s", sid, exc_info=True)
-    return target
-
-
-def _read_source_session_row(
-    db_path: Path,
-    sid: str,
-    *,
-    connection: sqlite3.Connection | None = None,
-) -> dict | None:
-    """Return the source ``sessions`` row for *sid* via a strict read-only open.
-
-    Returns ``None`` when the row is absent or the schema is missing ``id``.
-    """
-    connection_context = (
-        closing(_open_source_state_db_readonly(db_path))
-        if connection is None
-        else nullcontext(connection)
-    )
-    with connection_context as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(sessions)")
-        cols = {str(row[1]) for row in cur.fetchall()}
-        if "id" not in cols:
-            return None
-        wanted = [
-            c for c in (
-                "id", "title", "model", "source", "session_source", "parent_session_id",
-                "started_at", "ended_at", "end_reason", "cwd",
-            )
-            if c in cols
-        ]
-        cur.execute(
-            f"SELECT {', '.join(wanted)} FROM sessions WHERE id = ?",
-            (sid,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row is not None else None
-
-
-def _read_resume_source_snapshot(db_path: Path, sid: str, profile: str):
-    """Read row, lineage and transcript from one explicit SQLite snapshot."""
-    with closing(_open_source_state_db_readonly(db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        conn.execute("BEGIN")
-        try:
-            source_row = _read_source_session_row(db_path, sid, connection=conn)
-            report = read_session_lineage_report(
-                db_path,
-                sid,
-                strict_read_only=True,
-                raise_on_error=True,
-                connection=conn,
-            )
-            # Read exactly the lineage segments that the report validated.  Do
-            # not ask the message helper to rediscover the ancestry: older
-            # sessions schemas can support the lineage report without carrying
-            # every optional column used by that helper's stitch heuristic.
-            segment_ids = [
-                str(segment.get("session_id") or "").strip()
-                for segment in reversed(report.get("segments") or [])
-                if isinstance(segment, dict)
-            ]
-            segment_ids = [segment_id for segment_id in segment_ids if segment_id]
-            if not segment_ids:
-                segment_ids = [sid]
-            messages = []
-            for segment_id in segment_ids:
-                messages.extend(get_state_db_session_messages(
-                    segment_id,
-                    profile=profile,
-                    state_db_path=db_path,
-                    strict_read_only=True,
-                    raise_on_error=True,
-                    connection=conn,
-                    stitch_continuations=False,
-                ))
-            return source_row, report, messages
-        finally:
-            conn.rollback()
-
-
-class _ResumePublicationRejected(RuntimeError):
-    """Terminal failure of a published Resume sidecar's final verification.
-
-    Raised only after the unverified canonical has been denied + quarantined
-    (best effort). It is never swallowed into a success by the broad
-    post-publish recovery, so a verification failure stays terminal even when
-    the quarantine move itself fails (F1, Astra 94bfe8af).
-    """
-
-
-def _existing_sidecar_legacy_committed(session) -> bool:
-    """Legacy existing-sidecar idempotency/migration policy (A1-distinct path).
-
-    ONLY for a sidecar that a *previous* attempt (or a pre-fix deployment)
-    already owns: a marked publication is committed only when verified and not
-    denied, while an unprefixed legacy resume sidecar with no marker is treated
-    as committed for migration compatibility.
-
-    This predicate must NEVER be used to accept a publication owned by the
-    CURRENT Resume attempt: use ``_resume_attempt_publication_verified`` there,
-    which requires the explicit verified marker (A1).
-    """
-    if session is None:
-        return False
-    from api.models import is_resume_publication_denied, resume_publication_state
-
-    sid = str(getattr(session, "session_id", "") or "")
-    if is_resume_publication_denied(sid):
-        return False
-    state = resume_publication_state(session)
-    if state is None:
-        return True
-    return state == "verified"
-
-
-def _resume_attempt_publication_verified(session) -> bool:
-    """Strict proof that the CURRENT attempt's publication is committed (A1).
-
-    Requires the explicit ``resume_publication_state == 'verified'`` marker and
-    the absence of a denial. A missing, empty, unknown or provisional marker is
-    never accepted, so a marker lost (or never written) during a post-index or
-    post-link failure can no longer be adopted as a committed publication.
-    """
-    from api.models import resume_publication_strictly_verified
-
-    return resume_publication_strictly_verified(session)
-
-
-def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, timeout: float = 1.5):
-    """Bounded, fail-closed wait for a competing first publication to commit.
-
-    F2 (Astra 94bfe8af): a competing Resume must never report idempotent
-    success over a provisional artifact, but it must also not spuriously fail
-    when the first publisher is mid-verification and will commit shortly. Poll
-    for the explicit verified marker for a bounded window; return ``None`` when
-    no committed publication appears (the caller then fails closed).
-
-    F1/F2 (candidate5): the explicit verified marker is NOT commit-complete. The
-    winner still has rejection-capable work outstanding (index reconciliation and
-    the final denial check) after writing it, so a competing request may only
-    adopt the artifact once the winner's durable publishing record is GONE — and
-    that record is retired last, after the commit-complete proof. While the
-    record is still present without proof this returns ``None`` and the caller
-    fails closed with 409 instead of unguarding a publication that may still be
-    terminally rejected.
-    """
-    from api.models import is_resume_publication_denied, resume_publication_commit_pending
-
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    current = existing
-    while True:
-        try:
-            pending = resume_publication_commit_pending(sid, canonical_path=sidecar_path)
-        except Exception:
-            logger.debug("Failed to read the Resume publication state for %s", sid, exc_info=True)
-            pending = True  # fail closed
-        if _existing_sidecar_legacy_committed(current) and not pending:
-            return current
-        try:
-            if is_resume_publication_denied(sid):
-                return None
-        except Exception:
-            return None
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(0.02)
-        try:
-            fresh = _load_resume_sidecar_nonmutating(sidecar_path) if sidecar_path.exists() else None
-        except Exception:
-            fresh = None
-        if fresh is None:
-            return None
-        current = fresh
-
-
-def _resume_publication_commit_pending(sid: str, sidecar_path: Path) -> bool:
-    """Fail-closed form of the F1/F2 predicate: a record guards without proof."""
-    from api.models import resume_publication_commit_pending
-
-    try:
-        return resume_publication_commit_pending(sid, canonical_path=sidecar_path)
-    except Exception:
-        logger.debug("Failed to read the Resume publication state for %s", sid, exc_info=True)
-        return True
-
-
-def _resume_publication_orphan_is_dead(sid: str) -> bool:
-    """Fail-closed form of "this record's publisher is gone" (F2)."""
-    from api.models import recovery_orphan_is_dead
-
-    try:
-        return recovery_orphan_is_dead(sid)
-    except Exception:
-        logger.debug("Failed to classify the Resume publication record for %s", sid, exc_info=True)
-        return False
-
-
-def _complete_orphaned_resume_publication_commit(
-    sid: str,
-    existing,
-    sidecar_path: Path,
-    *,
-    profile: str,
-    db_path: Path,
-    root_id: str,
-    tip_id: str,
-    source_row,
-    report,
-) -> bool:
-    """Finish an orphaned publisher's commit as the new exclusive owner (F2).
-
-    A publisher that died after linking its canonical (possibly after writing the
-    verified marker) leaves a ``publishing`` record its own process can no longer
-    retire, and ``recover_crashed_resume_publication`` must refuse it — the
-    marker alone is not commit-complete. A *new* exclusive owner therefore has to
-    actually finish the commit. It may only do so after revalidating, against the
-    live source store, everything the dead publisher would have validated last:
-
-      * the artifact is a committed-looking (verified, non-denied) sidecar;
-      * its stored resume identity is exactly this resume's identity;
-      * the source row and lineage report still match this request's snapshot.
-
-    Only then is the durable commit-complete proof written for THAT artifact and
-    the record retired (``complete_crashed_resume_publication_commit``, which
-    additionally refuses a live owner, a same-process record and a denial).
-    Returns ``True`` only when the id is verifiably unguarded afterwards.
-    """
-    if existing is None:
-        return False
-    if not _existing_sidecar_legacy_committed(existing):
-        return False
-    try:
-        if _resume_existing_sidecar_conflict(
-            existing,
-            sid=sid,
-            profile=profile,
-            db_path=db_path,
-            root_id=root_id,
-            tip_id=tip_id,
-        ):
-            return False
-    except Exception:
-        logger.debug("Failed to revalidate the Resume identity for %s", sid, exc_info=True)
-        return False
-    try:
-        fresh_row, fresh_report, fresh_messages = _read_resume_source_snapshot(
-            db_path, sid, profile
-        )
-    except Exception:
-        logger.debug("Failed to re-read the Resume source snapshot for %s", sid, exc_info=True)
-        return False
-    if fresh_row != source_row or fresh_report != report:
-        # The source moved (or its lineage changed) after this request resolved
-        # it: the orphaned publication can no longer claim to be this lineage's
-        # terminal artifact, so it stays guarded and fail-closed.
-        return False
-    if list(getattr(existing, "messages", []) or []) != fresh_messages:
-        # A dead publisher may have left a verified but stale artifact. Two
-        # snapshots read by this retry cannot establish that artifact's content.
-        return False
-    from api.models import complete_crashed_resume_publication_commit
-
-    return complete_crashed_resume_publication_commit(sid, canonical_path=sidecar_path)
-
-
-def _handle_session_resume_in_webui(handler, body):
-    """POST /api/session/resume_in_webui — explicit writable handoff.
-
-    Contract (body): ``{session_id, profile, lineage_root_id, lineage_tip_id,
-    confirm: true}``. See the module note above for the full gate list. Returns
-    the materialised (or already-owned) session projection.
-    """
-    if not isinstance(body, dict):
-        return bad(handler, "Request body must be a JSON object")
-
-    # Human confirmation is mandatory — this is the ONLY path that converts a
-    # foreign, read-only-projected session into a writable WebUI sidecar.
-    if body.get("confirm") is not True:
-        return bad(handler, "Resume requires confirm=true", 400)
-
-    try:
-        require(body, "session_id")
-    except ValueError as e:
-        return bad(handler, str(e))
-    sid = str(body.get("session_id") or "").strip()
-    if not is_safe_session_id(sid):
-        return bad(handler, "invalid session_id", 400)
-
-    # Validate the profile shape before the allowlist so a malformed name is a
-    # clean 400 (not a confusing 403), then fail closed on the operator gate.
-    profile = _normalize_import_profile_value(body.get("profile"))
-    if not profile:
-        return bad(handler, "invalid profile", 400)
-
-    lineage_root_id = str(body.get("lineage_root_id") or "").strip()
-    lineage_tip_id = str(body.get("lineage_tip_id") or "").strip()
-    if not lineage_root_id or not lineage_tip_id:
-        return bad(handler, "lineage_root_id and lineage_tip_id are required", 400)
-
-    allowed = _resume_in_webui_allowed_profiles()
-    if not allowed:
-        return bad(
-            handler,
-            "resume_in_webui is disabled; set HERMES_WEBUI_RESUME_ALLOW_PROFILES",
-            403,
-        )
-    if profile not in allowed:
-        return bad(handler, "profile is not allowed to resume in WebUI", 403)
-
-    # The requested profile must be the WebUI's current active profile: resuming
-    # a foreign profile's session while serving another profile would materialise
-    # a sidecar the user cannot actually use.
-    from api.profiles import get_active_profile_name, get_hermes_home_for_profile
-    if not _profiles_match(profile, get_active_profile_name()):
-        return bad(handler, "active profile does not match requested profile", 403)
-
-    # Resolve the exact ``<profile home>/state.db`` with no fallback. A missing
-    # DB is a hard 404 — never silently resolve the active profile's store.
-    try:
-        db_path = (Path(get_hermes_home_for_profile(profile)) / "state.db").resolve()
-    except (OSError, ValueError) as exc:
-        logger.exception("Failed to resolve source store for Resume in WebUI")
-        return bad(handler, _sanitize_error(exc), 500)
-    if not db_path.exists():
-        return bad(handler, "Session not found in source store", 404)
-
-    try:
-        source_row, report, messages = _read_resume_source_snapshot(db_path, sid, profile)
-    except (OSError, sqlite3.Error) as exc:
-        logger.exception("Failed to read source store for Resume in WebUI")
-        return bad(handler, _sanitize_error(exc), 500)
-    if source_row is None:
-        return bad(handler, "Session not found in source store", 404)
-
-    # Positive source allowlist: only sessions whose owning surface has
-    # demonstrably finished its own lifecycle may be taken over.
-    effective_source = (
-        str(source_row.get("source") or "").strip().lower()
-        or str(source_row.get("session_source") or "").strip().lower()
-    )
-    if effective_source not in _RESUME_IN_WEBUI_SOURCE_ALLOWLIST:
-        return bad(
-            handler,
-            f"source {effective_source or 'unknown'!r} is not resumable in WebUI",
-            403,
-        )
-
-    sidecar_path = SESSION_DIR / f"{sid}.json"
-    try:
-        existing = _load_resume_sidecar_nonmutating(sidecar_path) if sidecar_path.exists() else None
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("Refusing Resume in WebUI over unreadable existing sidecar: %s", _sanitize_error(exc))
-        return bad(handler, "an unreadable WebUI sidecar already owns this session id", 409)
-
-    # F2 (Astra 94bfe8af): a canonical that a competing Resume has linked but
-    # not yet committed is PROVISIONAL. Never treat it as an owned writable
-    # sidecar (idempotent success) — wait briefly for the first publisher to
-    # commit, then fail closed.
-    #
-    # F1/F2 (candidate5): "committed" now means commit-complete, not merely
-    # marked verified: while the winner's durable publishing record is still
-    # present the winner is doing rejection-capable work (index reconciliation,
-    # final denial check) and this request must fail closed. Only a LIVE
-    # publisher is worth waiting for; a record stranded by a crashed publisher is
-    # resolved below by the exclusive recovery/commit-completion path, because
-    # waiting for a dead pid could only time out.
-    if existing is not None and (
-        not _existing_sidecar_legacy_committed(existing)
-        or _resume_publication_commit_pending(sid, sidecar_path)
-    ):
-        if not _resume_publication_orphan_is_dead(sid):
-            existing = _await_resume_publication_commit(existing, sidecar_path, sid)
-            if existing is None:
-                return bad(
-                    handler,
-                    "a Resume for this session is still being verified; refresh and retry",
-                    409,
-                )
-
-    # Concurrent-writer guard (B4): an unended source session may still be
-    # appended to by the process that owns it, so it is NEVER resumable — not
-    # even when WebUI already holds a matching writable sidecar from a previous
-    # explicit resume. A settled source can have been revived (``ended_at`` /
-    # ``end_reason`` cleared) after that sidecar was published, and the earlier
-    # "already owned" exemption then served an idempotent 200 over a source that
-    # is live again. The ended-source invariant is therefore checked BEFORE any
-    # idempotent success on every request: no project doc authoritatively grants
-    # an exemption from it.
-    ended_at = source_row.get("ended_at")
-    end_reason = str(source_row.get("end_reason") or "").strip()
-    if not ended_at and not end_reason:
-        return bad(
-            handler,
-            "source session appears active; refusing to resume a session "
-            "that may still be written by another process",
-            409,
-        )
-
-    # Lineage must match the client's exact root + tip so a stale sidebar entry
-    # cannot resume a session whose continuation chain moved under it.
-    if not report.get("found"):
-        return bad(handler, "Session not found in source store", 404)
-    if report.get("manual_review"):
-        return bad(
-            handler,
-            "lineage has a newer, branched, or ambiguous continuation; resume its current tip instead",
-            409,
-        )
-    if report.get("lineage_key") != lineage_root_id or report.get("tip_session_id") != lineage_tip_id:
-        return bad(handler, "lineage does not match the client's root/tip", 409)
-
-    if existing is not None:
-        conflict = _resume_existing_sidecar_conflict(
-            existing,
-            sid=sid,
-            profile=profile,
-            db_path=db_path,
-            root_id=lineage_root_id,
-            tip_id=lineage_tip_id,
-        )
-        if conflict:
-            return bad(handler, conflict, 409)
-        # B1: idempotent success is still publication authority. A live
-        # publication record for this id means an uncommitted (or denied)
-        # attempt owns it — including a marker-less artifact whose marker was
-        # lost by a failing publication — so this must not be served writable.
-        from api.models import (
-            is_resume_publication_denied as _is_denied,
-            recover_crashed_resume_publication as _recover,
-            resume_publication_authority_blocked as _authority_blocked,
-        )
-
-        # F3: a publisher that crashed after writing its durable ``publishing``
-        # record (but before retiring it) strands this id behind a record no
-        # attempt owns. A new exclusive owner — proven here by taking the
-        # cross-process ownership lock — may safely recover it, but ONLY when the
-        # canonical is absent or a COMMIT-COMPLETE publication. A durable denial
-        # is never cleared by recovery, so fail-closed admission is not weakened.
-        try:
-            _recover(sid)
-        except Exception:
-            logger.debug(
-                "Failed to recover a stranded Resume publication record for %s",
-                sid,
-                exc_info=True,
-            )
-
-        if _authority_blocked(sid) or _is_denied(sid):
-            # F2: recovery above deliberately refuses an orphan whose canonical
-            # carries only the verified marker — that marker is not
-            # commit-complete, and clearing its record would resurrect a
-            # publication that still had rejection-capable work outstanding when
-            # its publisher died. Such an orphan is instead *finished*: this
-            # request is the new exclusive owner, it has revalidated the resume
-            # identity and the source snapshot, and it writes the durable
-            # commit-complete proof for that exact artifact before retiring the
-            # record (which itself refuses a live owner, a same-process record
-            # and any denial).
-            completed = False
-            try:
-                completed = _complete_orphaned_resume_publication_commit(
-                    sid,
-                    existing,
-                    sidecar_path,
-                    profile=profile,
-                    db_path=db_path,
-                    root_id=lineage_root_id,
-                    tip_id=lineage_tip_id,
-                    source_row=source_row,
-                    report=report,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to complete an orphaned Resume publication for %s",
-                    sid,
-                    exc_info=True,
-                )
-            if not completed or _authority_blocked(sid) or _is_denied(sid):
-                return bad(
-                    handler,
-                    "a Resume for this session is still being published; refresh and retry",
-                    409,
-                )
-        return j(
-            handler,
-            {
-                "ok": True,
-                "resumed": False,
-                "idempotent": True,
-                "session": public_session_projection(
-                    existing.compact()
-                    | {
-                        "messages": existing.messages,
-                        "is_cli_session": bool(getattr(existing, "is_cli_session", True)),
-                    }
-                ),
-            },
-        )
-
-    from api.agent_sessions import SOURCE_LABELS
-    title = str(source_row.get("title") or "").strip() or title_from(messages, "Resumed session")
-    model = str(source_row.get("model") or "").strip() or "unknown"
-    created_at = source_row.get("started_at")
-    updated_at = source_row.get("ended_at") or source_row.get("started_at")
-
-    recovered_after_publish_error = False
-    idempotent_after_race = False
-    staging_path = (
-        SESSION_DIR
-        / ".resume-staging"
-        / f"{sid}.{uuid.uuid4().hex}.json"
-    )
-    # D1: coordinate first ownership acquisition with every participating
-    # writer. The claim fails closed while an ordinary save for this id is
-    # already registered, and makes new saves for this id refuse while it is
-    # held; it never serializes ordinary saves against each other, so the #765
-    # lock-free same-session concurrent-save contract is preserved.
-    import api.models as _models_mod
-    from api.models import (
-        RESUME_PUBLICATION_PROVISIONAL,
-        _clear_webui_deleted_session_tombstone,
-        _clear_webui_zero_message_orphan_tombstone,
-        begin_resume_publication,
-        claim_session_for_resume,
-        clear_resume_publication_denial,
-        finish_resume_publication,
-        is_resume_publication_denied,
-        mark_resume_publication_commit_complete,
-        mark_resume_publication_verified,
-        release_session_claim,
-        resume_claim_ownership_token,
-        resume_store_ownership_conflict,
-    )
-    publication_record_retired = False
-    publication_authority_established = False
-    # F1: the durable attempt token is set when (and only when) this request takes
-    # the in-flight publication record. It is read by the broad post-link
-    # recovery, which Pyright cannot see is reached only after the assignment.
-    publication_attempt: str | None = None
-    # Q2/Q6: the claim's durable ownership token. It IS the publication attempt
-    # token (see ``begin_resume_publication``), and it makes this request's claim
-    # release attributable: a release that cannot be attributed must not close a
-    # live owner's descriptor.
-    claim_ownership_token: str | None = None
-    if not claim_session_for_resume(sid):
-        # B2: distinguish a cross-process ownership conflict from an ordinary
-        # in-process save so the operator sees which authority refused.
-        if resume_store_ownership_conflict(sid):
-            return bad(
-                handler,
-                "another Resume for this session is in flight in another process; refresh and retry",
-                409,
-            )
-        return bad(
-            handler,
-            "a save for this session is in flight; refresh and retry",
-            409,
-        )
-    try:
-        try:
-            # #765: no writer lock is taken anywhere on this path. Ordinary saves
-            # must stay free to race on their own ``.tmp.<pid>.<tid>`` files, so
-            # first publication is claimed atomically by
-            # ``publish_staged_session_sidecar`` (an exclusive ``os.link`` whose
-            # FileExistsError is reconciled below) instead of being serialized by
-            # ``session_file_write_lock``.
-            # Q2/Q6: record this request's ownership token the moment the claim is
-            # live. Everything below (attempt token, retirement, release) is
-            # attributable to it, so a stray or stale release can never drop the
-            # epoch's descriptor while an attempt still owns it.
-            claim_ownership_token = resume_claim_ownership_token(sid)
-            # Re-open one fresh read snapshot at the publication boundary. The
-            # first snapshot proves internal consistency; this second read
-            # detects any source-row, lineage, or transcript change that landed
-            # while the request was validating policy and sidecar ownership.
-            current_row, current_report, current_messages = _read_resume_source_snapshot(
-                db_path,
-                sid,
-                profile,
-            )
-            if (
-                current_row != source_row
-                or current_report != report
-                or current_messages != messages
-            ):
-                return bad(
-                    handler,
-                    "source session changed while Resume in WebUI was validating; refresh and retry",
-                    409,
-                )
-            try:
-                candidate = import_cli_session(
-                    sid,
-                    title,
-                    messages,
-                    model,
-                    profile=profile,
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    parent_session_id=source_row.get("parent_session_id"),
-                    source_tag=effective_source,
-                    raw_source=effective_source,
-                    session_source=str(source_row.get("session_source") or effective_source),
-                    source_label=SOURCE_LABELS.get(effective_source, effective_source.upper()),
-                    read_only=False,
-                    resume_source_profile=profile,
-                    resume_source_state_db=str(db_path),
-                    resume_lineage_root_id=lineage_root_id,
-                    resume_lineage_tip_id=lineage_tip_id,
-                    workspace=source_row.get("cwd"),
-                    persist=False,
-                )
-                # F2/F3: the staged payload explicitly carries PROVISIONAL
-                # ownership. The canonical may be linked before final
-                # verification, but every reader / idempotency / index path
-                # requires the verified marker committed only after the final
-                # source re-read below succeeds.
-                candidate.resume_publication_state = RESUME_PUBLICATION_PROVISIONAL
-                staged = stage_session_sidecar(candidate, staging_path)
-                if (
-                    not _same_resume_identity(
-                        staged,
-                        sid=sid,
-                        profile=profile,
-                        db_path=db_path,
-                        root_id=lineage_root_id,
-                        tip_id=lineage_tip_id,
-                    )
-                    or list(getattr(staged, "messages", []) or []) != messages
-                    or bool(getattr(staged, "read_only", True))
-                ):
-                    raise RuntimeError("staged sidecar failed resume verification")
-                # B1: establish durable publication authority BEFORE the artifact
-                # can exist. If this fails, no canonical may be published at
-                # all — an artifact whose denial cannot be recorded durably must
-                # never be created, because a fresh lookup could then serve it
-                # and keep serving it after a restart. The record also makes the
-                # id fail closed by itself while the attempt is in flight or if
-                # this process dies mid-publication.
-                try:
-                    publication_attempt = begin_resume_publication(sid)
-                    publication_authority_established = True
-                except OSError as authority_exc:
-                    logger.error(
-                        "Refusing Resume in WebUI: durable publication authority "
-                        "could not be established: %s",
-                        _sanitize_error(authority_exc),
-                    )
-                    # Q7: the staged payload is already on disk (staged and
-                    # verified above), and nothing has been published, so without
-                    # this the refused request orphans a file in
-                    # ``.resume-staging`` for no reader — the same dead weight the
-                    # FileExistsError branch below discards.
-                    _discard_resume_staging_file(staging_path)
-                    return bad(
-                        handler,
-                        "could not establish durable Resume publication authority; "
-                        "refusing to publish",
-                        500,
-                    )
-                try:
-                    # The canonical path does not exist until this exclusive atomic
-                    # claim. Readers can observe either no writable sidecar or the
-                    # fully serialized, verified payload — never a partially written
-                    # or unverified window — and the claim is all-or-nothing against
-                    # a concurrent Resume request or a concurrent Session.save().
-                    publish_staged_session_sidecar(staged, staging_path)
-                except FileExistsError:
-                    _discard_resume_staging_file(staging_path)
-                    # Another writer won the claim for this id. F2: only a
-                    # COMMITTED (explicitly verified) winner may be reported as
-                    # an idempotent re-resume. While the winner is still
-                    # provisional, wait (bounded) for it to commit, then fail
-                    # closed instead of adopting an unverified artifact.
-                    try:
-                        published = (
-                            _load_resume_sidecar_nonmutating(sidecar_path)
-                            if sidecar_path.exists()
-                            else None
-                        )
-                    except Exception:
-                        return bad(
-                            handler,
-                            "an unreadable WebUI sidecar already owns this session id",
-                            409,
-                        )
-                    if published is None:
-                        return bad(
-                            handler,
-                            "an unreadable WebUI sidecar already owns this session id",
-                            409,
-                        )
-                    if not _existing_sidecar_legacy_committed(published):
-                        published = _await_resume_publication_commit(published, sidecar_path, sid)
-                        if published is None:
-                            return bad(
-                                handler,
-                                "a Resume for this session is still being verified; refresh and retry",
-                                409,
-                            )
-                    conflict = _resume_existing_sidecar_conflict(
-                        published,
-                        sid=sid,
-                        profile=profile,
-                        db_path=db_path,
-                        root_id=lineage_root_id,
-                        tip_id=lineage_tip_id,
-                    )
-                    if conflict:
-                        return bad(handler, conflict, 409)
-                    # Q1: a revocation that landed *inside this race window* (after
-                    # the legacy/committed pre-check and before this point) is not
-                    # a lost race to report as idempotent success. Check denial
-                    # first, as its own refusal: nothing is retired here — the
-                    # denial owns the record — and ``publication_record_retired``
-                    # therefore stays False, so the bookkeeping below cannot claim
-                    # a retirement that never happened.
-                    if is_resume_publication_denied(sid):
-                        return bad(
-                            handler,
-                            "a Resume for this session is still being published; refresh and retry",
-                            409,
-                        )
-                    # B1/B2: this attempt lost the exclusive claim race, so it
-                    # produced no artifact — but its own durable publication
-                    # record (written before the claim attempt) would otherwise
-                    # keep guarding an id whose winner has already committed.
-                    # Retire it and verify the id is genuinely unguarded before
-                    # reporting idempotent success.
-                    if not finish_resume_publication(sid, attempt=publication_attempt):
-                        return bad(
-                            handler,
-                            "a Resume for this session is still being published; refresh and retry",
-                            409,
-                        )
-                    publication_record_retired = True
-                    idempotent_after_race = True
-                    s = published
-                else:
-                    # Post-publish read-back: the canonical sidecar that is now
-                    # visible must round-trip to the exact verified identity we
-                    # measured. A load failure (for example malformed JSON) is a
-                    # verification failure, not a crash: it must not leave an
-                    # unverified artifact live or indexed.
-                    try:
-                        published = _load_resume_sidecar_nonmutating(sidecar_path)
-                    except Exception:
-                        published = None
-                    verified = (
-                        published is not None
-                        and _same_resume_identity(
-                            published,
-                            sid=sid,
-                            profile=profile,
-                            db_path=db_path,
-                            root_id=lineage_root_id,
-                            tip_id=lineage_tip_id,
-                        )
-                        and list(getattr(published, "messages", []) or []) == messages
-                    )
-                    if verified:
-                        # D2: re-open the source one last time AFTER publication.
-                        # The pre-publication snapshot ends before staging and
-                        # publish, so a source writer can still revive the row in
-                        # that window. Fail closed and quarantine the freshly
-                        # published artifact when the source moved, rather than
-                        # returning 200 over stale read-only projection.
-                        try:
-                            final_row, final_report, final_messages = _read_resume_source_snapshot(
-                                db_path,
-                                sid,
-                                profile,
-                            )
-                        except Exception as exc:
-                            # Any inability to re-read the source is treated as
-                            # "the source may have moved": fail closed.
-                            logger.warning(
-                                "Failed to re-read source store after Resume publication: %s",
-                                _sanitize_error(exc),
-                            )
-                            verified = False
-                        else:
-                            verified = (
-                                final_row == source_row
-                                and final_report == report
-                                and final_messages == messages
-                            )
-                    if not verified:
-                        # F1 (Astra 94bfe8af): final-verification failure is
-                        # TERMINAL. Deny the id first (durably, best effort) and
-                        # move the untrusted canonical out of the live
-                        # namespace; the rejection raised here is never turned
-                        # back into a success, even if the move itself failed.
-                        _quarantine_resume_sidecar(
-                            sidecar_path, sid, attempt=publication_attempt
-                        )
-                        raise _ResumePublicationRejected(
-                            "published sidecar failed post-publish verification"
-                        )
-                    # COMMIT: explicit verified ownership marker. Only after
-                    # this point may the session be served writable or
-                    # advertised by the sidebar/index.
-                    verified_session = mark_resume_publication_verified(published)
-                    # F3: the denial clear is authority-gated and returns whether
-                    # the denial is *verifiably* gone; a denial that survives
-                    # means this publication is still refused (a newer,
-                    # concurrent revocation outranks it), so it must not be
-                    # reported as success. The clear runs while this attempt
-                    # still holds the in-flight record — that record is its
-                    # proof of authority.
-                    denial_cleared = clear_resume_publication_denial(
-                        sid, attempt=publication_attempt
-                    )
-                    # F1: the durable publication record is this attempt's
-                    # authority and MUST outlive index reconciliation AND the
-                    # final authority check below. It is retired LAST (see the
-                    # commit block after the final check); retiring it early left
-                    # a committed artifact with no durable guard, so a
-                    # post-commit rejection could neither deny nor quarantine it
-                    # and it stayed served writable.
-                    try:
-                        # Route the index write through the models module
-                        # attribute (not the import-time alias) so an
-                        # index I/O fault is observable/attributable at the
-                        # same seam ordinary saves and the audit probes use.
-                        _models_mod._write_session_index(updates=[verified_session])
-                        if list(getattr(verified_session, "messages", []) or []):
-                            _clear_webui_zero_message_orphan_tombstone(sid)
-                            _clear_webui_deleted_session_tombstone(sid)
-                    except Exception:
-                        # An index/tombstone side effect failed AFTER the
-                        # verified commit. Do NOT silently adopt it: re-validate
-                        # that the explicit verified artifact is still intact
-                        # and the denial state is absent, and otherwise treat the
-                        # publication as terminally rejected (F1). This artifact
-                        # is THIS attempt's own commit, so the rejection is
-                        # forced: the committed-publication protection must never
-                        # block quarantining our own failing commit.
-                        logger.warning(
-                            "Failed to reconcile index after verified Resume publication",
-                            exc_info=True,
-                        )
-                        still = None
-                        try:
-                            still = (
-                                _load_resume_sidecar_nonmutating(sidecar_path)
-                                if sidecar_path.exists()
-                                else None
-                            )
-                        except Exception:
-                            still = None
-                        if not (
-                            still is not None
-                            and _resume_attempt_publication_verified(still)
-                            and _same_resume_identity(
-                                still,
-                                sid=sid,
-                                profile=profile,
-                                db_path=db_path,
-                                root_id=lineage_root_id,
-                                tip_id=lineage_tip_id,
-                            )
-                            and list(getattr(still, "messages", []) or []) == messages
-                        ):
-                            _quarantine_resume_sidecar(
-                                sidecar_path,
-                                sid,
-                                attempt=publication_attempt,
-                                force=True,
-                            )
-                            raise _ResumePublicationRejected(
-                                "published sidecar failed post-publish verification"
-                            ) from None
-                    # F3: verify publication authority one last time BEFORE the
-                    # response. A denial that is still recorded (or that a
-                    # concurrent revocation landed after the clear) means this
-                    # artifact is not servable, so the request must fail closed
-                    # instead of returning 200 over an artifact every lookup
-                    # will refuse. The artifact is ours (this attempt committed
-                    # the verified marker), so revoking it is legitimate.
-                    if not denial_cleared or is_resume_publication_denied(sid):
-                        _quarantine_resume_sidecar(
-                            sidecar_path,
-                            sid,
-                            attempt=publication_attempt,
-                            force=True,
-                        )
-                        raise _ResumePublicationRejected(
-                            "Resume publication denial could not be cleared; "
-                            "refusing to report success"
-                        )
-                    # B1/F3: the verified marker is a COMMIT only once the durable
-                    # publication record is retired — and that happens
-                    # LAST, only after the index reconciled and the final
-                    # authority check passed, so this attempt's authority guards
-                    # the id for the whole window between the verified commit and
-                    # the response. While the record survives, every lookup
-                    # refuses the artifact, so a failed retire must never report
-                    # success. The retire itself is this attempt's own action on
-                    # its own record; a rejection here force-quarantines the
-                    # artifact this attempt committed.
-                    #
-                    # F1/F2: the retire is gated on the durable
-                    # commit-complete proof, which is written HERE — after index
-                    # reconciliation and after the final denial check, the last
-                    # rejection-capable steps — and binds this exact artifact.
-                    # Without it the marker alone would claim "committed" while
-                    # this attempt could still reject the publication, which is
-                    # exactly what let a same-epoch sibling unlink this record
-                    # mid-commit (F1) and a restart resurrect the artifact (F2).
-                    if not mark_resume_publication_commit_complete(
-                        sid,
-                        attempt=publication_attempt,
-                        canonical_path=sidecar_path,
-                    ):
-                        _quarantine_resume_sidecar(
-                            sidecar_path,
-                            sid,
-                            attempt=publication_attempt,
-                            force=True,
-                        )
-                        raise _ResumePublicationRejected(
-                            "could not record the durable Resume commit-complete proof"
-                        )
-                    if not finish_resume_publication(sid, attempt=publication_attempt):
-                        _quarantine_resume_sidecar(
-                            sidecar_path,
-                            sid,
-                            attempt=publication_attempt,
-                            force=True,
-                        )
-                        raise _ResumePublicationRejected(
-                            "could not complete the durable Resume publication commit"
-                        )
-                    publication_record_retired = True
-                    s = verified_session
-            except _ResumePublicationRejected:
-                # Terminal: the canonical was already denied + quarantined.
-                # Never fall into the broad recovery below.
-                raise
-            except Exception as persist_exc:
-                _discard_resume_staging_file(staging_path)
-                # F1 (Astra 94bfe8af): recovery over a post-link error is
-                # allowed ONLY when the canonical carries the explicit verified
-                # marker AND reproduces the exact resume identity — i.e. final
-                # verification already succeeded. A provisional, denied,
-                # unreadable, or mismatched artifact is never adopted; it is
-                # made inaccessible (denial first) and the error re-raised.
-                # The resume claim (held for this whole block) makes ordinary
-                # saves for this id refuse, so any canonical that appeared here
-                # is attributable to this publication or a competing Resume.
-                try:
-                    recovered = (
-                        _load_resume_sidecar_nonmutating(sidecar_path)
-                        if sidecar_path.exists()
-                        else None
-                    )
-                except Exception:
-                    recovered = None
-                if (
-                    recovered is not None
-                    and _resume_attempt_publication_verified(recovered)
-                    and _same_resume_identity(
-                        recovered,
-                        sid=sid,
-                        profile=profile,
-                        db_path=db_path,
-                        root_id=lineage_root_id,
-                        tip_id=lineage_tip_id,
-                    )
-                    and list(getattr(recovered, "messages", []) or []) == messages
-                ):
-                    s = recovered
-                    recovered_after_publish_error = True
-                else:
-                    if sidecar_path.exists() or recovered is not None:
-                        # F1: this branch won the exclusive ``os.link``, so any
-                        # canonical here is THIS attempt's own artifact. Force the
-                        # quarantine: the committed-publication protection must
-                        # never block revoking our own failing commit, and a
-                        # transient readback failure (recovered=None) must not
-                        # skip the durable denial.
-                        _quarantine_resume_sidecar(
-                            sidecar_path,
-                            sid,
-                            attempt=publication_attempt,
-                            force=True,
-                        )
-                    raise persist_exc
-        except _ResumePublicationRejected as rejected_exc:
-            logger.error(
-                "Resume in WebUI publication rejected: %s",
-                _sanitize_error(rejected_exc),
-            )
-            return bad(handler, _sanitize_error(rejected_exc), 500)
-        except Exception as exc:
-            logger.exception("Failed to persist Resume in WebUI sidecar")
-            return bad(handler, _sanitize_error(exc), 500)
-    finally:
-        # B1 bookkeeping: a publication record must not outlive an attempt that
-        # neither published nor denied anything. If this attempt created no
-        # canonical and recorded no denial, retire its record so an unrelated
-        # refusal (for example "source changed while validating") cannot
-        # permanently guard the id. A live artifact or a recorded denial keeps
-        # its record: that IS the durable fail-closed state.
-        #
-        # F1 (candidate5): this abort is only safe while no sibling Resume is in
-        # flight. Same-epoch siblings share ONE durable record, so without the
-        # exclusivity proof below a sibling that aborts mid-flight (no canonical
-        # *yet*) could drop the record the other sibling is about to publish
-        # under — exactly the guard the winner's commit-complete transition
-        # depends on. The in-process claim registry is the authority: this
-        # request must still be the only live claim, and it must be its own.
-        try:
-            if (
-                publication_authority_established
-                and not publication_record_retired
-                and not sidecar_path.exists()
-                and not is_resume_publication_denied(sid)
-            ):
-                from api.models import (
-                    close_resume_abort_retirement,
-                    open_resume_abort_retirement,
-                )
-
-                if not open_resume_abort_retirement(
-                    sid, ownership_token=claim_ownership_token
-                ):
-                    logger.debug(
-                        "Leaving the Resume publication record for %s: another "
-                        "claim for this id is still in flight",
-                        sid,
-                    )
-                else:
-                    try:
-                        # Keep admissions closed until this attempt's durable
-                        # guard has been retired.
-                        finish_resume_publication(sid, attempt=publication_attempt)
-                    finally:
-                        close_resume_abort_retirement(
-                            sid, ownership_token=claim_ownership_token
-                        )
-        except Exception:
-            logger.debug("Failed to retire a stray Resume publication record", exc_info=True)
-        # Q6: release with the token this request captured from the claim, so an
-        # extra or stale release can never close the live epoch's descriptor.
-        # A missing token is refused rather than guessing another claim's owner.
-        release_session_claim(sid, ownership_token=claim_ownership_token)
-    assert s is not None
-    _publish_session_list_changed(
-        "session_resume_in_webui_reconciled" if recovered_after_publish_error else "session_resume_in_webui",
-        profile=profile,
-        session_id=sid,
-    )
-    return j(
-        handler,
-        {
-            "ok": True,
-            "resumed": not idempotent_after_race,
-            "idempotent": idempotent_after_race,
-            "session": public_session_projection(
-                s.compact()
-                | {
-                    "messages": list(getattr(s, "messages", None) or messages),
-                    "is_cli_session": True,
-                }
-            ),
-        },
-    )
-
-
 def _handle_session_import(handler, body):
     """Import a session from a JSON export. Creates a new session with a new ID."""
     if not body or not isinstance(body, dict):
@@ -34164,20 +31160,10 @@ def _handle_session_import(handler, body):
     except (TypeError, ValueError) as e:
         return bad(handler, str(e))
     model = body.get("model", DEFAULT_MODEL)
-    reasoning_effort = body.get("reasoning_effort")
-    if reasoning_effort is not None:
-        reasoning_effort = str(reasoning_effort or "").strip().lower()
-        if (
-            reasoning_effort
-            and reasoning_effort != "none"
-            and reasoning_effort not in api_config.VALID_REASONING_EFFORTS
-        ):
-            return bad(handler, "Invalid reasoning_effort")
     s = Session(
         title=title,
         workspace=workspace,
         model=model,
-        reasoning_effort=reasoning_effort,
         messages=messages,
         tool_calls=strip_public_internal_fields(raw_tool_calls),
         profile=get_active_profile_name(),
@@ -34186,7 +31172,7 @@ def _handle_session_import(handler, body):
     with LOCK:
         SESSIONS[s.session_id] = s
         SESSIONS.move_to_end(s.session_id)
-    _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
+        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     s.save()
     publish_session_list_changed("session_import")
     return j(

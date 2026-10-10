@@ -27,6 +27,20 @@ reject ambiguous or malformed ownership, and check rollback and repeated-load
 idempotence, with capacity cases up to 17 hooks and 64 tool cards. This coverage
 does not certify external provider execution or filesystem crash durability.
 
+Run `./scripts/test.sh tests/test_cancelled_history_real_producers.py` for independent Agent-flush versus WebUI-settlement clocks, later Gateway turns after a live Stop, legacy integer/fractional Stop owners, and tool-card owners on cold/cached paginated HTTP reads. A terminal Stop excludes only its proved raw execution block, including when it retained live partial output; proved later Gateway exchanges remain in display and next-send history. Ambiguous clock/content occurrences still prevent prefix restoration. Sidecar-only Stop tool-card regressions repeat full, tail, and earlier-page reads through the production handler and real HTTP for missing SQLite, empty SQLite, and native-image mirror rows fully filtered from display. Owners use exact saved message objects, including distinct assistants with identical prose; invisible and missing owners remain excluded, and saved card metadata stays unchanged. Snapshot-parent/non-cumulative child Stop coverage runs in a separate HTTP server process to exercise lineage cache store/hit paths and repeated full, tail, earlier and owner-absent pages, with missing, empty and nonempty SQLite. Cache row copies retain independently stored exact-owner provenance; reconciliation composes that map before pagination without mutating saved indices. The worker stubs write real SQLite rows and exercise production worker/HTTP paths; they do not certify a real provider call.
+
+## Context replay matching
+
+Run `./scripts/test.sh -q tests/test_context_replay_scaling.py tests/test_large_replay_settlement.py tests/test_issue1217_transcript_compaction.py tests/test_stale_user_context_contamination.py tests/test_context_message_stable_ids.py tests/test_issue6751_api_content_agent_replay.py`.
+The context suite compares serialized output against the former greedy algorithm
+over seeded adversarial sequences, checks summary identity boundaries and all
+three reconciliation branches, and counts normalization/key comparisons for
+disjoint, periodic and near-miss sequences. Operation budgets, not wall-clock
+thresholds, are the regression gate. Benchmark no-overlap histories separately
+from correctness checks; include the shared helper and its reconciliation caller,
+and report row count, interpreter and base revision with timings. Use synthetic
+rows or isolated copies, never production session state.
+
 ## Session-scoped media authorization
 
 Run `./scripts/test.sh tests/test_media_inline.py tests/test_media_session_preview_auth.py`.
@@ -141,9 +155,10 @@ that breaks the page for everyone).
 
 The same job then runs `tests/browser_new_chat_focus.py`, on the same agent-free
 setup: with every `/api/sessions` response held, New Chat, Cmd/Ctrl+K and the
-typed `/new` command must focus the composer (and `/new` show its toast), read
-the session list once, and show the new row once the list is released (#7936,
-#7996). Run it locally with `python tests/browser_new_chat_focus.py`.
+typed `/new` command must focus the composer (and `/new` show its toast), and
+the first message typed with no conversation open must be sent; each reads the
+session list once before that, and shows the new row once the list is released
+(#7936, #7996, #8004). Run it locally with `python tests/browser_new_chat_focus.py`.
 
 ## Public conversation lifecycle gate
 
@@ -227,6 +242,23 @@ read earlier content, including a small scroll gesture immediately after a live
 render. Subsequent streamed content must not pull the reader back to the bottom.
 Use the jump-to-latest control to resume following the live tail; after that,
 new streamed content should remain visible at the bottom.
+
+The authoritative behavior contract — including the input-tail re-pinning rules
+(scrolling back down to the tail you were aiming at re-pins immediately, even
+while the stream keeps growing) and the transcript's overscroll suppression —
+lives in
+[`docs/architecture/transcript-auto-follow-scroll.md`](docs/architecture/transcript-auto-follow-scroll.md).
+Verify it per that document's manual checklist across wide desktop, ordinary
+laptop width, and narrow/mobile viewport widths (touch: swipe up releases
+follow, swipe back down to the tail re-pins, and no bottom-edge vibration is
+visible while pinned during streaming), matching the responsive-state
+expectations in [`docs/UIUX-GUIDE.md`](docs/UIUX-GUIDE.md).
+
+Automated regression coverage for this section:
+`tests/test_fast_stream_shrink_clamp_unpin.py`,
+`tests/test_issue5637_stale_anchor_guard.py` (the `test_live_render_queue_*`
+ownership tests), `tests/test_2111_ios_pwa_bottom_scroll_stutter.py`, and
+`tests/test_mobile_layout.py` (the `.messages` overscroll suppression).
 
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
@@ -394,45 +426,6 @@ EXPECT:
   - The dropdown updates to "Gemini 2.5 Pro"
   - Switching away and back to the conversation restores the same model in the footer selector
 FAIL: Dropdown shows the wrong active model after a session switch, or sending uses a stale model.
-
-### T3.2a: Reasoning Effort Reflects Active Conversation
-SETUP: Two sessions using the same reasoning-capable model.
-STEPS:
-  1. In session A, select Low reasoning effort.
-  2. In session B, select High reasoning effort.
-  3. Switch A → B → A using the sidebar.
-  4. Repeat at desktop width and at a narrow/mobile width using the mobile composer configuration action.
-  5. Reload the page on each session and send a turn.
-EXPECT:
-  - The reasoning chip/action reads Low in session A and High in session B after every switch and reload.
-  - The next turn in each session uses that session's restored effort.
-  - The model chip remains unchanged when both sessions use the same model.
-FAIL: The reasoning control keeps the previously viewed session's value, resets after reload, or the next turn uses a stale effort.
-
-Repeat with different models: use a fast model with High/XHigh/Max in session A
-and a flagship model with Low in session B, selecting efforts supported by each
-model. Both the model and reasoning controls must restore together on desktop
-and narrow/mobile after A → B → A and reload. Capture before/after screenshots
-of both sessions for PR review.
-
-Configuration regressions are covered by `tests/test_session_reasoning_effort.py`:
-new-session model/effort defaults honor an external `HERMES_CONFIG_PATH` for root.
-With request-local context set to a named profile, a root/external config override
-must not replace that profile's model or effort; an override inside its own home
-still applies. Gateway legacy and runs API requests use the named session
-profile's reasoning default when no stored override exists. An explicit session
-override wins over both the named and process/root profile values. With distinct
-root/named Gateway URLs and keys, the initial request's URL, Authorization header,
-and retained stream endpoint must all belong to the session's profile, matching
-the endpoint used for reattachment, Stop, and approval replies.
-
-Delayed-save regressions are covered by `tests/test_reasoning_effort_save_race.py`.
-With a throttled connection, change A's effort through the dropdown or
-`/reasoning high`, then switch to B before the save returns. B must keep its own
-effort after the response and routine topbar sync; returning to A must fetch its
-saved effort. Repeat on desktop and mobile, and with a model, provider, or profile
-change while the save is pending. A save in an unchanged context must still update
-both desktop and mobile labels, even if an older reasoning GET returns afterward.
 
 ### T3.3: Context Badge Shares Footer Space Cleanly
 SETUP: Active session with at least one completed response.
