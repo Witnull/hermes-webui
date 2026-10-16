@@ -1123,6 +1123,39 @@ def resolve_trusted_workspace(path: str | Path | None = None, profile: str | Pat
         except ValueError:
             pass
 
+    # (A2) Trusted if under HERMES_HOME or the profile's home directory.
+    #      Covers deployments where HERMES_HOME is configured on another drive or outside
+    #      user home (e.g. F:/.hermes), as well as named profiles with {profile_home}/workspace.
+    try:
+        from api.profiles import get_active_hermes_home, get_hermes_home_for_profile
+        hermes_homes: list[Path] = []
+        if profile is not None:
+            try:
+                hermes_homes.append(Path(get_hermes_home_for_profile(profile)).resolve())
+            except Exception:
+                pass
+        try:
+            hermes_homes.append(Path(get_active_hermes_home()).resolve())
+        except Exception:
+            pass
+        try:
+            from api.profiles import _DEFAULT_HERMES_HOME
+            hermes_homes.append(Path(_DEFAULT_HERMES_HOME).resolve())
+        except Exception:
+            pass
+        env_home = os.getenv("HERMES_HOME")
+        if env_home:
+            hermes_homes.append(Path(env_home).resolve())
+
+        for h in hermes_homes:
+            try:
+                candidate.relative_to(h)
+                return candidate
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
     if _is_blocked_workspace_path(candidate, path):
         raise ValueError(f"Path points to a system directory: {candidate}")
 

@@ -14245,6 +14245,11 @@ def _plugin_visibility_payload(manager=None) -> dict:
         description = _clean_plugin_visibility_text(getattr(manifest, "description", ""), limit=280)
         kind = _clean_plugin_visibility_text(getattr(manifest, "kind", "") or "standalone", limit=40)
         enabled_flag = bool(getattr(loaded, "enabled", False))
+        try:
+            from api.custom_routes import get_custom_plugin_enabled_flag
+            enabled_flag = get_custom_plugin_enabled_flag(plugin_key, name, enabled_flag)
+        except Exception:
+            pass
         category = _plugin_visibility_category_from_key(plugin_key)
         selected_provider = _plugin_visibility_selected_provider(category)
         plugin_slug = plugin_key.rsplit("/", 1)[-1].strip().lower()
@@ -15201,6 +15206,12 @@ def _handle_session_get(handler, parsed) -> bool:
 
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
+    try:
+        from api.custom_routes import handle_custom_get
+        if handle_custom_get(handler, parsed):
+            return True
+    except Exception:
+        pass
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
     if proxy_result is not False:
         return proxy_result
@@ -16962,6 +16973,15 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         return True
+
+    try:
+        from api.custom_routes import handle_custom_post
+        if handle_custom_post(handler, parsed, body):
+            if diag:
+                diag.finish()
+            return True
+    except Exception:
+        pass
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
@@ -20292,6 +20312,12 @@ def handle_delete(handler, parsed) -> bool:
         return bad(handler, str(exc), status=status)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="DELETE"):
         return True
+    try:
+        from api.custom_routes import handle_custom_delete
+        if handle_custom_delete(handler, parsed, body):
+            return True
+    except Exception:
+        pass
     if parsed.path.startswith("/api/mcp/servers/"):
         # MCP server names are case-sensitive config keys: capture from the
         # original-case path, not the folded matching path.
@@ -20334,6 +20360,12 @@ def handle_put(handler, parsed) -> bool:
         return bad(handler, str(exc), status=status)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="PUT"):
         return True
+    try:
+        from api.custom_routes import handle_custom_put
+        if handle_custom_put(handler, parsed, body):
+            return True
+    except Exception:
+        pass
     if parsed.path.startswith("/api/mcp/servers/"):
         # MCP server names are case-sensitive config keys: capture from the
         # original-case path, not the folded matching path.
