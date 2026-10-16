@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from api.compression_anchor import visible_messages_for_anchor
 from api.models import Session
 from api.streaming import (
@@ -1331,3 +1333,160 @@ def test_tool_rows_with_distinct_durable_rows_still_backfill():
     )
 
     assert [m["content"] for m in merged if m.get("role") == "tool"] == ["first output", "other output"]
+
+
+def _summary_backfill_case(display_ids, context_ids):
+    """Display shows the full tool output; context carries the agent's one-line
+    summary of the same tool call. Returns the merged tool-row contents."""
+    full_output = "full search output " + ("x" * 200)
+    summary = "[search_files] content search -> 3 matches"
+    previous_display = [
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_s"}]},
+        {"role": "tool", "tool_call_id": "call_s", "content": full_output, **display_ids},
+        {"role": "assistant", "content": "found"},
+    ]
+    previous_context = [
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_s"}]},
+        {"role": "tool", "tool_call_id": "call_s", "content": summary, **context_ids},
+        {"role": "assistant", "content": "found"},
+    ]
+    result_messages = previous_context + [
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    merged = _merge_display_messages_after_agent_result(
+        previous_display, previous_context, result_messages, "next",
+    )
+    return [m["content"] for m in merged if m.get("role") == "tool"], full_output, summary
+
+
+def test_state_db_row_id_alias_is_the_same_durable_row():
+    """Greptile on release #8140: rows loaded from state.db carry
+    ``_state_db_row_id``, not ``_row_id``. The same durable row under either
+    alias must still suppress the summary backfill."""
+    rows, full_output, _summary = _summary_backfill_case({"_state_db_row_id": 190285}, {"_row_id": 190285})
+    assert rows == [full_output]
+    rows, full_output, _summary = _summary_backfill_case({"_state_db_row_id": "190285"}, {"_state_db_row_id": 190285})
+    assert rows == [full_output]
+
+
+@pytest.mark.parametrize(
+    "bad_ids",
+    [{}, {"_row_id": True}, {"_row_id": "abc"}, {"_row_id": 0}, {"_row_id": -4},
+     {"_row_id": 7, "_state_db_row_id": 8}],
+    ids=["missing", "bool", "string", "zero", "negative", "contradictory"],
+)
+def test_invalid_durable_identity_keeps_content_based_backfill(bad_ids):
+    """Without a valid durable identity the merge keeps today's content-based
+    behaviour: the differing summary is not proven to be the displayed row."""
+    rows, full_output, summary = _summary_backfill_case(bad_ids, bad_ids)
+    assert rows == [full_output, summary]
+
+
+def _durable_tool_display_and_context(context_tool_content):
+    durable = {"_row_id": 501, "message_uid": "a" * 32}
+    tool_call = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_x"}]}
+    display_tool = {"role": "tool", "tool_call_id": "call_x", "content": "full tool output", **durable}
+    context_tool = {"role": "tool", "tool_call_id": "call_x", "content": context_tool_content, **durable}
+    return tool_call, display_tool, context_tool
+
+
+def _roles_and_contents(messages):
+    return [(m.get("role"), m.get("content")) for m in messages]
+
+
+def test_durable_tool_match_anchors_backfill_before_webui_only_tail():
+    """The matched durable tool row must keep anchoring the backfill cursor:
+    a context-only follow-up stays after the visible tool result even when the
+    display tail is a WebUI-only row with no context twin."""
+    for context_tool_content in ("full tool output", "[terminal] ran `ls` -> exit 0, 1 lines output"):
+        tool_call, display_tool, context_tool = _durable_tool_display_and_context(context_tool_content)
+        previous_display = [
+            {"role": "user", "content": "run it"},
+            tool_call,
+            display_tool,
+            {"role": "assistant", "content": "WebUI-only notice"},
+        ]
+        previous_context = [
+            {"role": "user", "content": "run it"},
+            tool_call,
+            context_tool,
+            {"role": "user", "content": "context-only follow-up"},
+        ]
+        result_messages = previous_context + [
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        merged = _merge_display_messages_after_agent_result(
+            previous_display, previous_context, result_messages, "next",
+        )
+
+        assert _roles_and_contents(merged)[:5] == [
+            ("user", "run it"),
+            ("assistant", ""),
+            ("tool", "full tool output"),
+            ("user", "context-only follow-up"),
+            ("assistant", "WebUI-only notice"),
+        ], context_tool_content
+
+
+def test_durable_tool_match_anchors_backfill_when_tool_is_display_tail():
+    """When the visible tool result is the last display row, a final answer
+    present only in context must be backfilled after it, not before."""
+    for context_tool_content in ("full tool output", "[terminal] ran `ls` -> exit 0, 1 lines output"):
+        tool_call, display_tool, context_tool = _durable_tool_display_and_context(context_tool_content)
+        previous_display = [
+            {"role": "user", "content": "run it"},
+            tool_call,
+            display_tool,
+        ]
+        previous_context = [
+            {"role": "user", "content": "run it"},
+            tool_call,
+            context_tool,
+            {"role": "assistant", "content": "context-only final answer"},
+        ]
+        result_messages = previous_context + [
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        merged = _merge_display_messages_after_agent_result(
+            previous_display, previous_context, result_messages, "next",
+        )
+
+        assert _roles_and_contents(merged)[:4] == [
+            ("user", "run it"),
+            ("assistant", ""),
+            ("tool", "full tool output"),
+            ("assistant", "context-only final answer"),
+        ], context_tool_content
+
+
+def test_same_row_id_with_different_tool_call_ids_both_survive():
+    previous_display = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}, {"id": "call_2"}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "one", "_row_id": 77},
+        {"role": "assistant", "content": "done"},
+    ]
+    previous_context = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}, {"id": "call_2"}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "one", "_row_id": 77},
+        {"role": "tool", "tool_call_id": "call_2", "content": "two", "_row_id": 77},
+        {"role": "assistant", "content": "done"},
+    ]
+    result_messages = previous_context + [
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    merged = _merge_display_messages_after_agent_result(
+        previous_display, previous_context, result_messages, "next",
+    )
+
+    assert [m["content"] for m in merged if m.get("role") == "tool"] == ["one", "two"]
