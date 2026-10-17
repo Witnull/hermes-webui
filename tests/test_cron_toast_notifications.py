@@ -94,7 +94,7 @@ def test_cron_recent_marks_muted_jobs_without_requesting_toast(monkeypatch):
     monkeypatch.setattr(
         routes,
         "_latest_cron_session_info_for_jobs",
-        lambda job_ids, completed_job_ids=None, deadline_s=None: {
+        lambda job_ids, completed_job_ids=None: {
             str(job_id): {
                 "session_id": f"cron_{job_id}_latest",
                 "message_count": 3 if str(job_id) == "loud" else 5,

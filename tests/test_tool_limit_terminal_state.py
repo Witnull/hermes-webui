@@ -10,7 +10,6 @@ from api import models
 from api.process_event_utils import build_active_turn_token
 from api import streaming
 from api.models import Session
-from api.config import PENDING_GOAL_CONTINUATION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +39,7 @@ def _run_streaming_with_fake_agent(
     streaming.STREAMS.clear()
     streaming.AGENT_INSTANCES.clear()
     streaming.SESSION_AGENT_LOCKS.clear()
-    PENDING_GOAL_CONTINUATION.clear()
+    streaming.PENDING_GOAL_CONTINUATION.clear()
     try:
         from api.config import SESSION_AGENT_CACHE
 

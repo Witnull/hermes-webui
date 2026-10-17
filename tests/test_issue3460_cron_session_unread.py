@@ -412,7 +412,6 @@ function _isSessionActivelyViewedForList() {{ return false; }}
 function _setSessionViewedCount(sid, count) {{ viewed.push([sid, count]); }}
 function _markSessionCompletionUnread(sid, count) {{ unread.push([sid, count]); }}
 function renderSessionListFromCache() {{ renders += 1; }}
-function _getSessionViewedCounts() {{ return {{}}; }}
 function _repaintSidebarForBackgroundChurn() {{ renderSessionListFromCache(); }}
 global.window = {{}};
     eval(extractFunc('_markSessionCompletionUnreadIfBackground'));

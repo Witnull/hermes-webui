@@ -6,20 +6,15 @@ address that session's stream id and must only clear approval/clarify UI owned b
 that session.
 """
 from pathlib import Path
-import re
 
 ROOT = Path(__file__).parent.parent
 BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
 
 
-def _function_body(src: str, name: str, window: int | None = 1800) -> str:
+def _function_body(src: str, name: str, window: int = 1800) -> str:
     idx = src.find(f"function {name}(")
     assert idx >= 0, f"{name} not found"
-    if window is None:
-        next_function = re.search(r"\n(?:async )?function ", src[idx + 1 :])
-        assert next_function, f"end of {name} not found"
-        return src[idx : idx + 1 + next_function.start()]
     return src[idx : idx + window]
 
 
@@ -30,13 +25,12 @@ class TestSidebarCancelAction:
         # Rename action item, then to 5200 in #2111 for response-aware archive
         # toast handling, then to 6400 in #2294 for the new "Hide from list"
         # action prepended for external sessions, then to 7600 in #3106 for
-        # manual title regeneration controls, then to 8200 for the read-only
-        # "Resume in WebUI" action appended after the Copy-link entry.
+        # manual title regeneration controls.
         # The `session.active_stream_id` / cancelSessionStream / delete checks
         # are positional further down in the function, so growing the prefix
         # required growing this read window; where the completion repaints route
         # through the picker-aware wrappers added the last few bytes (#6713).
-        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 8500)
+        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 7900)
         assert "session.active_stream_id" in body, (
             "sidebar action menu must detect per-session active_stream_id instead of S.activeStreamId"
         )
@@ -49,7 +43,7 @@ class TestSidebarCancelAction:
 
     def test_cancel_session_stream_uses_session_owned_stream_id(self):
         """Cancel-from-sidebar must call /api/chat/cancel with the row's stream id."""
-        body = _function_body(BOOT_JS, "cancelSessionStream", None)
+        body = _function_body(BOOT_JS, "cancelSessionStream")
         assert "session&&session.active_stream_id" in body or "session && session.active_stream_id" in body
         assert "stream_id=${encodeURIComponent(streamId)}" in body
         assert "S.activeStreamId" not in body.split("const streamId", 1)[1].split("fetch", 1)[0], (
@@ -58,7 +52,7 @@ class TestSidebarCancelAction:
 
     def test_cancel_session_stream_clears_only_owned_clarify_and_approval_cards(self):
         """Cancelling A from sidebar must not blanket-clear B's clarify/approval cards."""
-        body = _function_body(BOOT_JS, "cancelSessionStream", None)
+        body = _function_body(BOOT_JS, "cancelSessionStream")
         assert "_clarifySessionId===sid" in body, (
             "clarify card cleanup must be gated to the cancelled session id"
         )

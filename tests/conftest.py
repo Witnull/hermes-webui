@@ -519,18 +519,12 @@ def _discover_python(agent_dir) -> str:
         for venv_dir in ('venv', '.venv'):
             for subdir, binary in (('bin', 'python'), ('Scripts', 'python.exe')):
                 venv_py = agent_dir / venv_dir / subdir / binary
-                try:
-                    if venv_py.is_file():
-                        return str(venv_py)
-                except OSError:
-                    pass
+                if venv_py.exists():
+                    return str(venv_py)
     for subdir, binary in (('bin', 'python'), ('Scripts', 'python.exe')):
         local_venv = REPO_ROOT / '.venv' / subdir / binary
-        try:
-            if local_venv.is_file():
-                return str(local_venv)
-        except OSError:
-            pass
+        if local_venv.exists():
+            return str(local_venv)
     return shutil.which('python3') or shutil.which('python') or 'python3'
 
 HERMES_AGENT = _discover_agent_dir()

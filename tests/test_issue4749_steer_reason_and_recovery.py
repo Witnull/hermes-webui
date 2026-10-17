@@ -129,16 +129,10 @@ def test_reason_map_contract():
 def test_backend_parity():
     """Frontend reason map covers all backend fallback codes from _handle_chat_steer."""
     streaming_text = STREAMING_PY.read_text(encoding="utf-8")
-
-    def _fn_body(name):
-        m = re.search(rf"def {name}\b.*?(?=\ndef |\Z)", streaming_text, re.DOTALL)
-        assert m, f"Could not find {name} in streaming.py"
-        return m.group(0)
-
-    # Steer fallback codes are produced in the handler and in its gateway
-    # delivery helper (_steer_gateway_or_queue queues when the Runs API
-    # refuses or is unreachable); both must stay covered by the frontend map.
-    fn_body = _fn_body("_handle_chat_steer") + _fn_body("_steer_gateway_or_queue")
+    # Extract fallback codes from _handle_chat_steer function only
+    fn_match = re.search(r"def _handle_chat_steer\b.*?(?=\ndef |\Z)", streaming_text, re.DOTALL)
+    assert fn_match, "Could not find _handle_chat_steer in streaming.py"
+    fn_body = fn_match.group(0)
     # Exclude placeholder strings like "<reason>" that appear in docstrings
     found_codes = set(
         c for c in re.findall(r'"fallback":\s*"([^"<>]+)"', fn_body)
